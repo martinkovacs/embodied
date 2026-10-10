@@ -1,0 +1,17 @@
+{
+  "left": "0",
+  "right": "1",
+  "width": 1280,
+  "height": 960,
+  "cols": 9,
+  "rows": 6,
+  "square_mm": 25.0,
+  "board_mm": 0.8,
+  "test_mode": true,
+  "test_calib_left": "synthetic/calib/left_*.png",
+  "test_calib_right": "synthetic/calib/right_*.png",
+  "test_table_left": "synthetic/table_left.png",
+  "test_table_right": "synthetic/table_right.png",
+  "test_scene_left": "synthetic/scene_left.png",
+  "test_scene_right": "synthetic/scene_right.png"
+}
