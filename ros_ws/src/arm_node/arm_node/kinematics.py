@@ -15,6 +15,12 @@ TOOL = 146.7                    # joint4 -> fingertips (finger mesh). The URDF e
                                 # behind the tips. Measure on the real arm.
 LIMITS = [(-pi, pi), (-1.5, 1.5), (-1.5, 1.4), (-1.7, 1.97)]
 R_MIN = 80.0                    # from the joint1 axis; closer, the hanging fingers hit the base
+# Tune in the lab. Heights are fingertip z in the robot frame: the table is at z = 0 if the arm stands on it,
+# -8 if it stands on the ROBOTIS base plate (robot_frame.py prints where the table is). Here, not in arm_node.py,
+# so runner.py checks the layout at the same heights the arm moves to.
+GRASP_Z = 5.0                   # fingertips just above the table, fingers around most of the 30 mm piece
+PLACE_Z = GRASP_Z + 3.0         # release a little above where it was picked up
+LIFT = 60.0                     # approach and retreat this much above GRASP_Z, clear of the 30 mm pieces
 
 UPPER = hypot(UP_X, UP_Z)
 LEAN = atan2(UP_X, UP_Z)        # upper arm's forward lean at q2 = 0

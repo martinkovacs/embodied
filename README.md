@@ -90,7 +90,8 @@ docker exec -d -e DISPLAY=:1 robot-arm bash -c 'source /opt/ros/humble/setup.bas
   camera images per trial. `logs/` is gitignored: it's participant data.
 
 If something unplanned happens (piece not in its slot, arm error, failed check after placing), the trial stops
-and the panel asks the experimenter to **retry / skip / abort**. The robot never asks an unscripted question,
+and the panel asks the experimenter to **retry / skip / abort**, or **accept** when the arm did place the piece
+but the camera missed it. A skip logs how far the trial got (`step`), so you can tell what the participant saw. The robot never asks an unscripted question,
 because that would contaminate the conditions. **STOP** halts the arm immediately.
 
 ## 4. In the lab (real arm, real cameras)

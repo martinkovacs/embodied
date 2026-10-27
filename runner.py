@@ -7,11 +7,12 @@ Files:
   scenarios/<condition>.yaml   slot order + per-trial script; names its layout
   layouts/*.yaml               the printed template: piece slots and zone spots (table mm), robot frame file
   participants.csv             participant -> conditions in the order they run (counterbalancing)
-  logs/<participant>_<condition>.jsonl, logs/<participant>_<condition>/trialNN_{left,right}.png
+  logs/<participant>_<condition>.jsonl, logs/<participant>_<condition>/trialNN_aA_{before,after}_{left,right}.png  (A = attempt)
 
 Participant answers come in through Runner.answer(): the operator panel buttons for now, speech.py later.
 Anything unplanned (piece not where the layout says, arm failure, failed verify) halts the trial and asks the
-operator to retry / skip / abort. The robot never improvises a question: that would contaminate the conditions.
+operator to retry / skip / abort, or accept when the camera missed a piece the arm did place. The robot never
+improvises a question: that would contaminate the conditions.
 
 Usage (from the repo root):
     venv/bin/python runner.py --participant P00 [--block 1] [--vision synthetic|cameras] [--arm ros|fake]
@@ -35,13 +36,13 @@ import numpy as np
 import yaml
 
 import robot_frame
-from arm_node.kinematics import ik  # noqa: E402  on sys.path via robot_frame
+from arm_node.kinematics import GRASP_Z, LIFT, PLACE_Z, ik  # noqa: E402  on sys.path via robot_frame
 
 ROOT = Path(__file__).resolve().parent
 COLORS = ("red", "blue", "green", "white")
 BEHAVIORS = ("correct", "mistake", "ask")
 MATCH_MM = 20.0                 # a detection this close to a slot / spot is the piece there (pieces are 35 mm)
-REACH_Z = (5.0, 65.0)           # arm_node GRASP_Z and GRASP_Z + LIFT: every slot and spot must be reachable at both
+REACH_Z = (GRASP_Z, PLACE_Z, GRASP_Z + LIFT)   # arm_node's heights: every slot and spot must be reachable at all
 ARM_TIMEOUT_S = 60.0
 PORT = 8081
 SAY = {"ask": "Is this {color}?", "which": "Which colour is it?", "done": "Done."}
@@ -164,6 +165,8 @@ class RosArm:
         try:
             s = await asyncio.wait_for(fut, ARM_TIMEOUT_S)
         except TimeoutError:
+            self.waiting.pop(cmd["id"], None)
+            self.stop()  # a hung controller keeps arm_node busy until its goal is cancelled
             raise RuntimeError(f"no answer from arm_node in {ARM_TIMEOUT_S:.0f} s (is it running?)") from None
         if s["state"] != "done":
             raise RuntimeError(s.get("reason", s["state"]))
@@ -187,6 +190,7 @@ class Log:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path, self.f = path, path.open("a")
         self.participant, self.condition, self.trial, self.tail = participant, condition, 0, []
+        self.attempt = 1
 
     def __call__(self, event, **data):
         rec = {"t_wall": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
@@ -201,7 +205,7 @@ class Log:
             d = self.path.with_suffix("")
             d.mkdir(exist_ok=True)
             for side, img in zip(("left", "right"), pair):
-                cv2.imwrite(str(d / f"trial{self.trial:02d}_{tag}_{side}.png"), img)
+                cv2.imwrite(str(d / f"trial{self.trial:02d}_a{self.attempt}_{tag}_{side}.png"), img)
 
 
 class Runner:
@@ -212,6 +216,7 @@ class Runner:
         self.used = dict.fromkeys(COLORS, 0)   # next free spot in each zone
         self.prompt = None                     # {"kind": "answer" | "operator", "options", "text", "fut"}
         self.status, self.task, self.said_at = "ready", None, None
+        self.step = self.placed = None         # this trial's last arm op done, and the zone it placed in
 
     # --- input: participant answers (panel now, speech later) and operator choices ---
     def answer(self, word, source="panel"):
@@ -263,6 +268,7 @@ class Runner:
         except RuntimeError as e:
             raise Unplanned(f"arm {op}: {e}") from None
         self.log("arm_done", op=op)
+        self.step = op
         self.vision.after(op, x, y)
 
     def detect(self, tag):
@@ -274,6 +280,7 @@ class Runner:
     # --- the experiment ---
     async def trial(self, slot, behavior):
         color, sx, sy = self.sc["slots"][slot]
+        self.step = self.placed = None
         self.log("trial_start", slot=slot, color=color, **behavior)
         p = nearest(self.detect("before"), sx, sy)
         if p is None or p[0] != color:
@@ -291,6 +298,7 @@ class Runner:
         tx, ty = self.sc["zones"][target][self.used[target]]
         await self.move("place", tx, ty)
         self.used[target] += 1
+        self.placed = target
         await self.move("home")
         p = nearest(self.detect("after"), tx, ty)
         if p is None or p[0] != color:
@@ -306,20 +314,29 @@ class Runner:
                 self.log.trial = i
                 self.status = f"trial {i}/{len(sc['order'])}: {slot}"
                 behavior = sc["script"].get(i, {"behavior": "correct"})
+                self.log.attempt = 1
                 while True:
                     try:
                         await self.trial(slot, behavior)
                         break
                     except Unplanned as e:
-                        self.log("unplanned", reason=str(e))
-                        choice, _ = await self._wait("operator", ("retry", "skip", "abort"),
-                                                     f"UNPLANNED: {e}. Fix the setup, then:")
+                        self.log("unplanned", reason=str(e), step=self.step)
+                        # placed but not confirmed (camera miss, home failed): the operator can confirm it by eye
+                        options = ("retry", "skip", "abort") + (("accept",) if self.placed else ())
+                        held = " The piece is in the gripper: take it out." if self.step in ("pick", "show") else ""
+                        choice, _ = await self._wait("operator", options, f"UNPLANNED: {e}.{held} Fix the setup, then:")
                         self.log("operator_override", choice=choice)
-                        if choice == "skip":
-                            self.log("trial_end", skipped=True)
+                        if choice == "accept":
+                            color = sc["slots"][slot][0]
+                            self.log("trial_end", placed=self.placed, correct=self.placed == color,
+                                     operator_verified=True)
+                            break
+                        if choice == "skip":  # step: how far it got, i.e. what the participant saw
+                            self.log("trial_end", skipped=True, step=self.step)
                             break
                         if choice == "abort":
                             return
+                        self.log.attempt += 1
             self.log.trial = 0
             await self.say("done")
             end = "done"
@@ -353,8 +370,8 @@ def panel(runner, title):
             for w in ("yes", "no", *COLORS):
                 ui.button(w, on_click=lambda w=w: runner.answer(w))
         with ui.row() as ops:
-            for c in ("retry", "skip", "abort"):
-                ui.button(c, on_click=lambda c=c: runner.choose(c))
+            op_buttons = {c: ui.button(c, on_click=lambda c=c: runner.choose(c))
+                          for c in ("retry", "skip", "abort", "accept")}
         log = ui.log(max_lines=300).classes("w-full h-96")
         shown = {"n": 0}
 
@@ -362,6 +379,8 @@ def panel(runner, title):
             p = runner.prompt
             status.text, prompt.text = runner.status, p["text"] if p else ""
             answers.visible, ops.visible = bool(p and p["kind"] == "answer"), bool(p and p["kind"] == "operator")
+            for c, b in op_buttons.items():
+                b.visible = bool(p and c in p["options"])
             for line in runner.log.tail[shown["n"]:]:
                 log.push(line)
             shown["n"] = len(runner.log.tail)
@@ -409,8 +428,41 @@ def self_test():
             c, x, y = r.sc["slots"][r.sc["order"][0]]
             world.found.remove(nearest(world.found, x, y))
         r, ev = run("correct", lambda kind, opts: "skip" if kind == "operator" else "yes", remove_first)
-        assert len(last(ev, "unplanned")) == 1 and last(ev, "trial_end")[0] == {"skipped": True}
+        assert len(last(ev, "unplanned")) == 1 and last(ev, "trial_end")[0] == {"skipped": True, "step": None}
         assert len(last(ev, "trial_end")) == len(r.sc["order"])
+
+        # the arm fails after the pick: no "accept" (nothing placed), skip logs how far it got
+        class PlaceFailsOnce(FakeArm):
+            failed = False
+
+            async def do(self, op, x=None, y=None):
+                if op == "place" and not self.failed:
+                    self.failed = True
+                    raise RuntimeError("controller error")
+        offered = []
+        r = Runner(f"T{len(os.listdir(tmp))}", "correct", PlaceFailsOnce(), world, tmp, audio=False,
+                   auto=lambda kind, opts: offered.append(opts) or "skip")
+        world.reset()
+        asyncio.run(r.run())
+        ev = [json.loads(line) for line in r.log.path.read_text().splitlines()]
+        assert offered == [("retry", "skip", "abort")], offered
+        assert last(ev, "trial_end")[0] == {"skipped": True, "step": "pick"}
+
+        # placed, but the camera misses it: the operator accepts, the trial counts as done
+        def camera_misses_first_place(op, x, y):
+            if op == "place" and not missed:
+                missed.append(1)
+                world.held = None
+            else:
+                SimWorld.after(world, op, x, y)
+        missed, world.after = [], camera_misses_first_place
+        try:
+            r, ev = run("correct", lambda kind, opts: "accept" if "accept" in opts else "yes")
+        finally:
+            del world.after
+        assert last(ev, "unplanned")[0]["step"] == "home"
+        assert last(ev, "trial_end")[0] == {"placed": "red", "correct": True, "operator_verified": True}
+        assert len(last(ev, "trial_end")) == len(r.sc["order"]) and not any("skipped" in e for e in last(ev, "trial_end"))
     print("runner self-test ok")
 
 

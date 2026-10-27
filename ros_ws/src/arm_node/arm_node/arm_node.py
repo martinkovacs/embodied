@@ -22,14 +22,10 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from arm_node.kinematics import ik
+from arm_node.kinematics import GRASP_Z, LIFT, PLACE_Z, ik
 
 JOINTS = ["joint1", "joint2", "joint3", "joint4"]
-# Tune in the lab. Heights are fingertip z in the robot frame: the table is at z = 0 if the arm stands on it,
-# -8 if it stands on the ROBOTIS base plate (robot_frame.py prints where the table is).
-GRASP_Z = 5.0                   # fingertips just above the table, fingers around most of the 30 mm piece
-PLACE_Z = GRASP_Z + 3.0         # release a little above where it was picked up
-LIFT = 60.0                     # approach and retreat this much above GRASP_Z, clear of the 30 mm pieces
+# Tune in the lab (grasp heights: kinematics.py).
 HOME = [0.0, -1.0, 0.7, 0.3]    # ROBOTIS "home" (SRDF); check that it hides no piece from either camera
 SHOW = [0.0, -0.3, -0.3, 0.6]   # gripper level, held out along +x at ~28 cm; turn joint1 toward the participant
 OPEN, CLOSED = 0.019, -0.01     # gripper_left_joint limits, m; closing on a piece just stalls on it
