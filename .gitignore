@@ -1,1 +1,6 @@
 __pycache__/
+
+# colcon output of ros_ws (built inside the robot-arm container)
+ros_ws/build/
+ros_ws/install/
+ros_ws/log/
