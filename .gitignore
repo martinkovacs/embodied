@@ -4,3 +4,7 @@ __pycache__/
 ros_ws/build/
 ros_ws/install/
 ros_ws/log/
+
+venv/
+# participant data: never commit
+logs/
