@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>One trial of the robot-trust experiment</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Serif:ital@0;1&family=Noto+Sans+KR:wght@400;500;600&family=Noto+Serif+KR:wght@400&family=Noto+Sans+TC:wght@400;500;600&family=Noto+Serif+TC:wght@400&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;   /* white-smoke */
+      --color-ink:     #2d3142;   /* jet-black */
+      --color-muted:   #4f5d75;   /* blue-slate */
+      --color-accent:  #bf4520;   /* burnt-tangerine */
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif', 'Noto Serif KR', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1200px; width: 100%; }
+    /* The SVG holds its readable width (min-width == the viewBox width, so the
+       type ramp is never silently scaled down). This wrapper lets a narrow
+       screen scroll the diagram instead of the whole page. */
+    .diagram-container { width: 100%; overflow-x: auto; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 960px; display: block; }
+    /* Paper has no scrollbar, so the local scroller would clip instead of
+       scroll. Let the diagram scale down to the sheet: smaller but whole
+       beats sharp but cut off. Must come after the svg rule above - a media
+       query adds no specificity, so a later plain rule would win. */
+    @media print {
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Flowchart · robot-trust</p>
+    <h1>What happens in one trial</h1>
+
+    <!-- Replace trial-flow with a unique slug for this diagram before export. -->
+    <div class="diagram-container">
+      <svg viewBox="0 0 960 772" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="trial-flow-title trial-flow-desc">
+        <title id="trial-flow-title">One trial of the robot-trust experiment</title>
+        <desc id="trial-flow-desc">Each trial checks the piece is in its slot, picks it, then follows the script: place correctly, place in a wrong zone, or show the piece and ask the participant first; anything unexpected goes to the operator.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+          <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+          <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+
+          <!-- OPTIONAL: dot-pattern background. Uncomment the <pattern> and the second <rect> below if you want the dotted paper look. -->
+          <!--
+          <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+            <circle cx="1" cy="1" r="0.9" fill="rgba(45,49,66,0.10)"/>
+          </pattern>
+          -->
+        </defs>
+
+        <rect width="100%" height="100%" fill="#f5f5f5"/>
+        <!-- <rect width="100%" height="100%" fill="url(#dots)" opacity="0.55"/> -->
+
+<path d="M320,72 V108" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M320,188 V220" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="328" y="196" width="23" height="12" rx="2" fill="#f5f5f5"/>
+<text x="339.5" y="205" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">YES</text>
+<path d="M408,148 H520" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="455.0" y="128" width="18" height="12" rx="2" fill="#f5f5f5"/>
+<text x="464" y="137" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">NO</text>
+<path d="M320,268 V304" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M320,384 V460" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="328" y="416" width="43" height="12" rx="2" fill="#f5f5f5"/>
+<text x="349.5" y="425" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">CORRECT</text>
+<path d="M232,344 H216 Q208,344 208,352 V476 Q208,484 216,484 H240" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="156.5" y="404" width="43" height="12" rx="2" fill="#f5f5f5"/>
+<text x="178" y="413" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">MISTAKE</text>
+<path d="M408,344 H520" fill="none" stroke="#bf4520" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+<rect x="452.5" y="324" width="23" height="12" rx="2" fill="#f5f5f5"/>
+<text x="464" y="333" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">ASK</text>
+<path d="M600,368 V476 Q600,484 592,484 H400" fill="none" stroke="#bf4520" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+<rect x="608" y="416" width="68" height="12" rx="2" fill="#f5f5f5"/>
+<text x="642.0" y="425" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">YES / COLOUR</text>
+<path d="M320,508 V544" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M320,624 V656" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="328" y="632" width="23" height="12" rx="2" fill="#f5f5f5"/>
+<text x="339.5" y="641" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">YES</text>
+<path d="M408,584 H752 Q760,584 760,576 V156 Q760,148 752,148 H680" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="571.0" y="564" width="18" height="12" rx="2" fill="#f5f5f5"/>
+<text x="580" y="573" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.06em">NO</text>
+<rect x="240" y="32" width="160" height="40" rx="20" fill="#f5f5f5"/>
+<rect x="240" y="32" width="160" height="40" rx="20" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="320.0" y="56.0" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Trial N starts</text>
+<polygon points="320,108 408,148 320,188 232,148" fill="#f5f5f5"/>
+<polygon points="320,108 408,148 320,188 232,148" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="320" y="149" fill="#2d3142" font-size="11" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Piece at slot?</text>
+<text x="320" y="162" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">vision, arm at home</text>
+<rect x="240" y="220" width="160" height="48" rx="6" fill="#f5f5f5"/>
+<rect x="240" y="220" width="160" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="320.0" y="245.0" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Pick the piece</text>
+<text x="320.0" y="259.0" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">arm_node pick</text>
+<polygon points="320,304 408,344 320,384 232,344" fill="#f5f5f5"/>
+<polygon points="320,304 408,344 320,384 232,344" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1"/>
+<text x="320" y="345" fill="#2d3142" font-size="11" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Script for trial N</text>
+<text x="320" y="358" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">scenario YAML</text>
+<rect x="520" y="320" width="160" height="48" rx="6" fill="#f5f5f5"/>
+<rect x="520" y="320" width="160" height="48" rx="6" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1"/>
+<text x="600.0" y="345.0" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Show it and ask</text>
+<text x="600.0" y="359.0" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">Is this red? → wait</text>
+<rect x="520" y="124" width="160" height="48" rx="6" fill="#f5f5f5"/>
+<rect x="520" y="124" width="160" height="48" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+<text x="600.0" y="149.0" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Operator decides</text>
+<text x="600.0" y="163.0" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">retry · skip · abort</text>
+<rect x="240" y="460" width="160" height="48" rx="6" fill="#f5f5f5"/>
+<rect x="240" y="460" width="160" height="48" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="320.0" y="485.0" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Place, go home</text>
+<text x="320.0" y="499.0" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">own / wrong zone</text>
+<polygon points="320,544 408,584 320,624 232,584" fill="#f5f5f5"/>
+<polygon points="320,544 408,584 320,624 232,584" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="320" y="585" fill="#2d3142" font-size="11" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Verify OK?</text>
+<text x="320" y="598" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">piece in the zone</text>
+<rect x="240" y="656" width="160" height="40" rx="20" fill="#f5f5f5"/>
+<rect x="240" y="656" width="160" height="40" rx="20" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="320.0" y="680.0" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Next trial</text>
+<line x1="32" y1="728" x2="928" y2="728" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+<text x="32" y="748" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">LEGEND</text>
+<rect x="104" y="738" width="24" height="12" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="136" y="748" fill="#2d3142" font-size="9" font-family="'Geist', system-ui, sans-serif">Start / end</text>
+<rect x="219.4" y="738" width="24" height="12" rx="3" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="251.4" y="748" fill="#2d3142" font-size="9" font-family="'Geist', system-ui, sans-serif">Step</text>
+<polygon points="309.0,736 321.0,744 309.0,752 297.0,744" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="329.0" y="748" fill="#2d3142" font-size="9" font-family="'Geist', system-ui, sans-serif">Decision</text>
+<rect x="396.2" y="738" width="24" height="12" rx="3" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1"/>
+<text x="428.2" y="748" fill="#2d3142" font-size="9" font-family="'Geist', system-ui, sans-serif">Experimental manipulation</text>
+<rect x="587.2" y="738" width="24" height="12" rx="3" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+<text x="619.2" y="748" fill="#2d3142" font-size="9" font-family="'Geist', system-ui, sans-serif">Unplanned: operator</text>
+
+      </svg>
+    </div>
+  </div>
+</body>
+</html>

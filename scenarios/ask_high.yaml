@@ -1,0 +1,11 @@
+# PLACEHOLDER trial numbers: how many mistakes / questions, and on which trials, is for the psych team to decide.
+# Same order in every condition, so trial N is always the same piece. Trials not in script: correct.
+condition: ask_high
+layout: layouts/synthetic.yaml
+order: [r1, w1, g1, b1, r2, w2, g2, r3, w3, g3, r4, r5]
+script:
+  2: {behavior: ask}
+  4: {behavior: ask}
+  6: {behavior: ask}
+  9: {behavior: ask}
+  11: {behavior: ask}
