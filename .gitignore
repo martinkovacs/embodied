@@ -8,3 +8,6 @@ ros_ws/log/
 venv/
 # participant data: never commit
 logs/
+
+# speech models (downloaded, ~1 GB)
+models/

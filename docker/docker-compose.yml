@@ -5,8 +5,8 @@ services:
     image: robot-arm
     container_name: robot-arm
     ports:
-      - "6080:80"     # desktop: http://localhost:6080
-      - "9090:9090"   # rosbridge (host Python code connects here)
+      - "127.0.0.1:6080:80"     # desktop: http://localhost:6080 (this machine only)
+      - "127.0.0.1:9090:9090"   # rosbridge, unauthenticated: anyone who reaches it drives the arm
     shm_size: 2gb
     volumes:
       - ../ros_ws:/ws   # arm_node + sim world; keep the clone out of iCloud ~/Documents, Docker can't read evicted files
