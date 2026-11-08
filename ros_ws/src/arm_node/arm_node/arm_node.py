@@ -11,7 +11,8 @@ terminated, or nothing was running); otherwise it answers "failed" and the reaso
 the operator must then assume the arm may still be moving and use the power switch. The running command fails
 with "stopped" either way. Every controller answer is timed out (goal acceptance 5 s; arm result, trajectory
 duration + 5 s; gripper result 5 s; cancel 2 s): a controller that never answers (USB dropout) fails the
-command instead of leaving the node busy for ever.
+command instead of leaving the node busy for ever, and no later command moves anything until that goal is
+confirmed cancelled.
 
 Run after the ROBOTIS bringup (hardware.launch.py or gazebo.launch.py):  ros2 run arm_node arm_node
 """
@@ -81,6 +82,7 @@ class ArmNode(Node):
         self.op_xy = None               # (x, y) of the running (or last interrupted) pick/place: the lift home
         self.goal = None                # running controller goal, cancelled by stop
         self.sending = None             # the goal request in flight, while its acceptance is awaited
+        self.adrift = None              # a timed-out goal (handle) or request (future) that may yet move the arm
         self.busy = self.stopped = False
         self.create_subscription(JointState, "/joint_states", self.on_joints, 10)
         # reentrant: a stop has to get through while a command is still awaiting the controllers
@@ -118,6 +120,10 @@ class ArmNode(Node):
             self.busy, self.stopped = True, False
             try:
                 self.reply(cmd, "started")
+                state, reason = await self.settle_adrift()
+                if state != "done":
+                    raise RuntimeError(f"an earlier goal may still move the arm (check it, then restart arm_node): "
+                                       f"{reason}")
                 await self.run(cmd)
             finally:
                 self.busy = False
@@ -137,7 +143,28 @@ class ArmNode(Node):
             state, reason = "failed", f"stop: {e}"
         self.reply(cmd, state, reason)
 
+    async def settle_adrift(self):
+        """A goal that timed out may still run, or a request still be accepted: nothing else may move until the
+        controller confirms it is cancelled. ("done", None) when nothing is adrift, else ("failed", reason), and it
+        stays adrift. A controller that never answers keeps the node refusing until it is restarted."""
+        adrift = self.adrift
+        if adrift is None:
+            return "done", None
+        if isinstance(adrift, rclpy.task.Future):
+            if not adrift.done():
+                return "failed", "an earlier goal request is still unanswered"
+            adrift = adrift.result()
+            if not adrift.accepted:
+                self.adrift = None
+                return "done", None
+        state, reason = await self.cancelled(adrift)
+        if state == "done":
+            self.adrift = None
+        return state, reason
+
     async def _stop_outcome(self):
+        if self.adrift is not None:     # never beside a running goal: a command settles this before it moves
+            return await self.settle_adrift()
         handle = self.goal
         if handle is None:
             fut = self.sending          # a command is still awaiting acceptance: don't lose the stop here, or
@@ -149,10 +176,14 @@ class ArmNode(Node):
                 # send(), which owns the request, has failed and late-cancels it if it is accepted after all:
                 # nothing was ever confirmed though
                 return "failed", f"stop: goal acceptance still pending after {GOAL_ACCEPT_S:.0f} s"
-            except Exception:           # the request itself failed: nothing was accepted
-                return "done", None
+            except Exception as e:      # no answer to go on: don't claim nothing was accepted
+                return "failed", f"stop: goal request failed, acceptance unknown: {e}"
             if not handle.accepted:     # rejected: nothing is moving
                 return "done", None
+        return await self.cancelled(handle)
+
+    async def cancelled(self, handle):
+        """Cancel one goal and verify it: ("done", None), or ("failed", reason) when the controller refuses."""
         res = await self.await_ft(handle.cancel_goal_async(), CANCEL_ACK_S, "cancel request")
         code = CancelGoal.Response      # old-style names in Humble: the cancel answer's class
         if res.return_code == code.ERROR_NONE and res.goals_canceling:
@@ -259,6 +290,7 @@ class ArmNode(Node):
                 except Exception:
                     pass
             fut.add_done_callback(cancel_late)
+            self.adrift = fut
             raise RuntimeError(str(e)) from None    # no handle yet: the goal request itself is dropped
         finally:
             self.sending = None                # settled either way: a later stop still sees self.goal
@@ -271,6 +303,7 @@ class ArmNode(Node):
             res = await self.await_ft(handle.get_result_async(), result_timeout, f"{what} result")
         except TimeoutError as e:
             handle.cancel_goal_async()  # tell the controller to stop on the way out too
+            self.adrift = handle        # and the next command or stop verifies that it did
             raise RuntimeError(str(e)) from None
         finally:
             self.goal = None

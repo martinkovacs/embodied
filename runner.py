@@ -63,6 +63,14 @@ SAY = {"ask": "Is this {color}?", "which": "Which colour is it?", "done": "Done.
 PLAYERS = ("pw-play", "paplay", "aplay", "afplay")   # first one installed plays the WAVs
 
 
+class ArmTimeout(RuntimeError):
+    """arm_node never answered a command. confirmed, reason: how the stop sent after it went."""
+
+    def __init__(self, message, confirmed, reason):
+        super().__init__(message)
+        self.confirmed, self.reason = confirmed, reason
+
+
 class Unplanned(Exception):
     pass
 
@@ -252,8 +260,10 @@ class RosArm:
             self.cmd.publish(self.roslibpy.Message({"data": json.dumps(cmd)}))
             s = await asyncio.wait_for(fut, ARM_TIMEOUT_S)
         except TimeoutError:
-            self.stop()  # a hung controller keeps arm_node busy until its goal is cancelled (fire-and-forget)
-            raise RuntimeError(f"no answer from arm_node in {ARM_TIMEOUT_S:.0f} s (is it running?)") from None
+            # a hung controller keeps arm_node busy until its goal is cancelled, and the arm may still be moving
+            confirmed, reason = await self.stop_confirm() if self.stop() else (False, "stop was not sent")
+            raise ArmTimeout(f"no answer from arm_node in {ARM_TIMEOUT_S:.0f} s (is it running?)",
+                             confirmed, reason) from None
         finally:
             self.waiting.pop(cid, None)
         if s["state"] != "done":
@@ -491,8 +501,10 @@ class Runner:
             else:
                 note = ""
             choice, _, _ = await self._wait("operator", options, f"{reason}{note} Fix the setup, then:")
-            self.log("operator_override", choice=choice)
+            self.log("operator_override", choice=choice,
+                     **({"stop_problem": self.stop_problem} if self.stop_problem else {}))
             if choice != "open gripper":
+                self.stop_problem = None    # the operator went on over the warning: the line above says so
                 break
             try:
                 await self.move("open")
@@ -573,6 +585,11 @@ class Runner:
             self.held = True                   # may be in the gripper from now on: not just after a pick finished
         try:
             await self.arm.do(op, rx, ry, rz)
+        except ArmTimeout as e:  # its stop is logged and warned about like the operator's
+            self.log("stop_confirm", source="timeout", confirmed=e.confirmed, reason=e.reason)
+            if not e.confirmed:
+                self.stop_not_confirmed(e.reason)
+            raise Unplanned(f"arm {op}: {e}") from None
         except Exception as e:  # CancelledError (STOP) isn't an Exception: it passes
             raise Unplanned(f"arm {op}: {e}") from None
         self.log("arm_done", op=op)
@@ -1382,7 +1399,38 @@ def self_test():
             arm.on_status({"data": json.dumps({"id": first, "state": "done"})})
             arm.on_status({"data": json.dumps({"id": second, "state": "failed", "reason": "rejected"})})
             assert await arm.stop_confirm() == (False, "rejected") and not arm.waiting
+
+            # a command that times out reports how its stop went
+            published.clear()
+            timeout, globals()["ARM_TIMEOUT_S"] = ARM_TIMEOUT_S, 0.01
+            try:
+                task = asyncio.create_task(arm.do("home"))
+                while len(published) < 2:
+                    await asyncio.sleep(0.001)
+                stop_id = json.loads(published[1]["data"])["id"]
+                arm.on_status({"data": json.dumps({"id": stop_id, "state": "failed", "reason": "rejected"})})
+                try:
+                    await task
+                    raise AssertionError("no ArmTimeout")
+                except ArmTimeout as e:
+                    assert (e.confirmed, e.reason) == (False, "rejected"), (e.confirmed, e.reason)
+            finally:
+                globals()["ARM_TIMEOUT_S"] = timeout
         asyncio.run(latest_stop_counts())
+
+        # a timed-out command whose stop wasn't confirmed: logged and warned about like the operator's STOP
+        class TimesOut(FakeArm):
+            picks = 0
+
+            async def do(self, op, x=None, y=None, z=None):
+                self.picks += op == "pick"
+                if op == "pick" and self.picks == 1:
+                    raise ArmTimeout("no answer", False, "no reply")
+                await asyncio.sleep(0)
+        r, ev = run("correct", lambda k, o: "retry" if k == "operator" else "yes", arm=TimesOut())
+        assert last(ev, "stop_confirm") == [{"source": "timeout", "confirmed": False, "reason": "no reply"}]
+        assert last(ev, "operator_override") == [{"choice": "retry", "stop_problem": "no reply"}]
+        assert r.stop_problem is None and r.state == "done", (r.stop_problem, r.state)
 
         # with the voice on, a question nobody could hear is unplanned, not an answer
         which = shutil.which
