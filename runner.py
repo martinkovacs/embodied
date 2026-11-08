@@ -1136,11 +1136,11 @@ def self_test():
         finally:
             shutil.which = which
         assert len(last(ev, "unplanned")) == 0   # audio=False in run(): silent on purpose
-        r = Runner(f"T{len(os.listdir(tmp))}", "ask_low", FakeArm(), world, tmp, audio=True,
-                   auto=lambda kind, opts: "skip" if kind == "operator" else "yes")
-        world.reset()
         shutil.which = lambda name: None
         try:
+            r = Runner(f"T{len(os.listdir(tmp))}", "ask_low", FakeArm(), world, tmp, audio=True,
+                       auto=lambda kind, opts: "skip" if kind == "operator" else "yes")
+            world.reset()
             asyncio.run(r.run())
         finally:
             shutil.which = which
