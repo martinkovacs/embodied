@@ -1,0 +1,2 @@
+{"T_robot_table": [[0, -1, 0, 30], [1, 0, 0, -100], [0, 0, 1, 0], [0, 0, 0, 1]],
+ "note": "made up for the synthetic scene: robot base at table (100, 30) facing -y. The real one comes from robot_frame.py"}

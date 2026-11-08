@@ -1,0 +1,23 @@
+# Layout for the synthetic scene (synthetic/scene_*.png): slots are where pieces.py finds the reachable pieces
+# there. The real lab layout is a printed template with marked slots and zone spots, written the same way.
+# All positions: table frame mm (calib_data/calib.json). runner.py checks that the arm reaches every one.
+robot_frame: synthetic/robot_frame.json
+slots:            # id: [colour, x, y]
+  r1: [red, 196.2, -0.8]
+  r2: [red, 117.7, -80.1]
+  r3: [red, 188.9, -130.2]
+  r4: [red, 98.2, -122.2]
+  r5: [red, 11.7, -29.8]
+  r6: [red, 40.7, -99.4]
+  w1: [white, 152.6, -81.1]
+  w2: [white, 41.7, -47.8]
+  w3: [white, 130.8, -156.2]
+  b1: [blue, 199.1, -76.9]
+  g1: [green, 231.8, -64.1]
+  g2: [green, 47.7, -132.5]
+  g3: [green, 13.9, -124.2]
+zones:            # colour: spots in the order they fill up, [x, y]
+  red:   [[230, 30], [270, 30], [300, 30], [230, 70], [270, 70], [300, 70]]
+  blue:  [[-100, 30], [-70, 30], [-30, 30], [-100, 70], [-70, 70], [-30, 70]]
+  green: [[220, 110], [260, 110], [220, 150], [260, 150]]
+  white: [[-60, 110], [-20, 110], [-60, 150], [-20, 150]]
