@@ -148,7 +148,7 @@ On the lab PC (with ROS 2 Humble + the ROBOTIS packages + this repo's `ros_ws` b
 
 ```bash
 ros2 launch open_manipulator_x_bringup hardware.launch.py      # port_name:=/dev/ttyUSB0 is the default
-ros2 launch rosbridge_server rosbridge_websocket_launch.xml
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml address:=<lab-pc-ip>   # the cable to the laptop only
 ros2 run arm_node arm_node
 ```
 
@@ -157,7 +157,8 @@ On the laptop: `venv/bin/python runner.py --participant P07 --block 1 --vision c
 If the link to rosbridge drops, STOP can't reach the arm: the panel says so in red, and the stop is logged with
 `sent: false`. Keep the torque-off / power switch in reach. rosbridge has no authentication: anyone who reaches
 port 9090 can move the arm. Connect the laptop and the
-lab PC directly (cable) or firewall 9090 to the laptop's address. The operator panel listens on 127.0.0.1
+lab PC directly (cable), bind rosbridge to that address as above (without `address:=` it listens on every
+interface), and firewall 9090 to the laptop's address if the lab PC shares that network with anything else. The operator panel listens on 127.0.0.1
 only; `--panel-host 0.0.0.0` exposes it to the network.
 
 ### Calibrate before any participant, in this order
