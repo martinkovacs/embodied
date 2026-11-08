@@ -57,6 +57,7 @@ MATCH_MM = 20.0                 # a detection this close to a slot / spot is the
 SPACING_MM = 40.0               # zone spots at least this far from every other spot and slot (centre to centre)
 REACH_Z = (GRASP_Z, PLACE_Z, GRASP_Z + LIFT)   # arm_node's heights: every slot and spot must be reachable at all
 ARM_TIMEOUT_S = 60.0
+STOP_CONFIRM_S = 8.0            # the node's worst case to confirm a stop: GOAL_ACCEPT_S + CANCEL_ACK_S
 PORT = 8081
 SAY = {"ask": "Is this {color}?", "which": "Which colour is it?", "done": "Done."}
 PLAYERS = ("pw-play", "paplay", "aplay", "afplay")   # first one installed plays the WAVs
@@ -220,7 +221,7 @@ class RosArm:
         self.ros = roslibpy.Ros(host=host, port=9090)
         self.ros.run(timeout=10)  # raises if rosbridge isn't up
         self.cmd = roslibpy.Topic(self.ros, "/arm/cmd", "std_msgs/String")
-        self.waiting, self.n = {}, 0
+        self.waiting, self.n, self.last_stop = {}, 0, None
         self.nonce = os.urandom(3).hex()    # a reply meant for an earlier runner (or replayed) never matches ours
         roslibpy.Topic(self.ros, "/arm/status", "std_msgs/String").subscribe(self.on_status)
 
@@ -232,7 +233,10 @@ class RosArm:
         s = json.loads(msg["data"])
         if s["state"] != "started" and (w := self.waiting.pop(s.get("id"), None)):
             loop, fut = w
-            loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(s))
+            try:
+                loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(s))
+            except RuntimeError:    # the loop is gone (shutdown): nobody is awaiting this reply any more
+                pass
 
     async def do(self, op, x=None, y=None, z=None):
         self.n += 1
@@ -248,7 +252,7 @@ class RosArm:
             self.cmd.publish(self.roslibpy.Message({"data": json.dumps(cmd)}))
             s = await asyncio.wait_for(fut, ARM_TIMEOUT_S)
         except TimeoutError:
-            self.stop()  # a hung controller keeps arm_node busy until its goal is cancelled
+            self.stop()  # a hung controller keeps arm_node busy until its goal is cancelled (fire-and-forget)
             raise RuntimeError(f"no answer from arm_node in {ARM_TIMEOUT_S:.0f} s (is it running?)") from None
         finally:
             self.waiting.pop(cid, None)
@@ -256,11 +260,35 @@ class RosArm:
             raise RuntimeError(s.get("reason", s["state"]))
 
     def stop(self):
-        """True if the stop went out. roslibpy would queue it while disconnected and send it on reconnect: worse."""
+        """True if the stop went out. roslibpy would queue it while disconnected and send it on reconnect: worse.
+        Each stop gets its own id, so on_status can match the node's answer instead of every stop looking like
+        id 0: stop_confirm() awaits that answer."""
         if not self.connected:
             return False
-        self.cmd.publish(self.roslibpy.Message({"data": json.dumps({"id": 0, "op": "stop"})}))
+        self.n += 1
+        cid = f"{self.nonce}-{self.n}"
+        loop = asyncio.get_running_loop()   # a stop is only ever sent from the panel's / do's event loop
+        fut = loop.create_future()
+        self.waiting[cid] = (loop, fut)     # nothing else to match: other commands' ids are distinct
+        self.last_stop = cid, fut
+        self.cmd.publish(self.roslibpy.Message({"data": json.dumps({"id": cid, "op": "stop"})}))
         return True
+
+    async def stop_confirm(self):
+        """(True, None) once the latest stop was confirmed: the node's "done" (goal cancelled / already terminated /
+        nothing ran). (False, reason) otherwise: the node failed to cancel, or sent no answer within STOP_CONFIRM_S
+        (its own worst case is GOAL_ACCEPT_S + CANCEL_ACK_S): presume the arm may still move. Only the latest stop
+        counts: an earlier one (a timed-out command's, which nobody awaits) says nothing about this one."""
+        if not self.last_stop:
+            return False, "no stop sent"
+        cid, fut = self.last_stop
+        try:
+            s = await asyncio.wait_for(fut, STOP_CONFIRM_S)
+        except TimeoutError:
+            return False, f"no answer from arm_node in {STOP_CONFIRM_S:.0f} s (is it running?)"
+        finally:
+            self.waiting.pop(cid, None)
+        return (True, None) if s["state"] == "done" else (False, s.get("reason", s["state"]))
 
 
 class FakeArm:
@@ -271,6 +299,9 @@ class FakeArm:
 
     def stop(self):
         return True
+
+    async def stop_confirm(self):
+        return True, None       # the fake arm is still at once: nothing to confirm
 
 
 class Voice:
@@ -363,6 +394,9 @@ class Runner:
         self.status, self.task, self.said_at = "ready", None, None
         self.at_home = False                   # the arm's last op was a home that finished
         self.held = False                      # a piece is (or may be) in the gripper: after a pick, until a place / open
+        self.in_trial = False                  # trial_start logged and its trial_end not: the trial has begun
+        self.stop_problem = None               # why the last STOP wasn't confirmed: the arm may still be moving
+        self.confirming = None                 # the task awaiting the node's answer to the last STOP
         self.on_say = (lambda: None, lambda: None)   # (a line starts, it ended): the speech bridge mutes around it
         self.new_trial()
         self.interrupted = "STOPPED by the operator."
@@ -377,22 +411,25 @@ class Runner:
         self.step = self.moving = None         # this attempt's last arm op done; the op in flight (stays if it failed)
         self.target = self.spot = None         # the zone and spot index reserved for this trial's place
         self.placed = None                     # the zone a finished place op put the piece in
+        self.in_trial = False                  # a crash between trials never opened the next one
 
     def replay(self, events):
         """Rebuild the zone spots taken and the interrupted trial's state from an unfinished session's events."""
         for e in events:
             d = e["data"]
             if e["event"] == "trial_start":
-                self.log.trial, self.log.attempt = e["trial"], e.get("attempt", 1)
                 self.new_trial()
+                self.log.trial, self.log.attempt, self.in_trial = e["trial"], e.get("attempt", 1), True
             elif e["event"] == "trial_end":
-                self.log.trial = e["trial"] + 1
+                self.log.trial, self.in_trial = e["trial"] + 1, False
                 self.new_trial()
             elif e["event"] == "spot":
                 self.used[d["zone"]] += 1 if d["action"] == "reserve" else -1
                 self.target, self.spot = (d["zone"], d["index"]) if d["action"] == "reserve" else (None, None)
             elif e["event"] == "arm_cmd":
                 self.moving = d["op"]
+                if d["op"] == "pick":
+                    self.held = True           # may be in the gripper from now on (move() does the same when sent)
             elif e["event"] == "arm_done":
                 self.step, self.moving = d["op"], None
                 self.held = d["op"] in ("pick", "show") or (self.held and d["op"] == "home")
@@ -464,16 +501,19 @@ class Runner:
         color = self.sc["slots"][slot][0]
         if choice == "abort":
             self.log("trial_end", aborted=True, step=self.step, moving=self.moving)
+            self.in_trial = False
             raise Aborted
         if choice == "accept":  # the operator saw the piece in the zone
             self.log("trial_end", placed=self.placed or self.target, correct=(self.placed or self.target) == color,
                      operator_verified=True)
+            self.in_trial = False
             self.held = False
             return None
         # skip / retry: the operator has dealt with the gripper (the prompt said so)
         self.held = False
         if choice == "skip":  # step / moving: how far it got, i.e. what the participant saw
             self.log("trial_end", skipped=True, step=self.step, moving=self.moving)
+            self.in_trial = False
             return None
         self.log.attempt += 1
         if self.placed:
@@ -529,6 +569,8 @@ class Runner:
         self.log("arm_cmd", op=op, **({} if x is None else {"table": [round(x, 1), round(y, 1)],
                                                              "robot": [round(rx, 1), round(ry, 1), round(rz, 1)]}))
         self.at_home, self.moving = False, op  # until a home finishes: a failed or stopped op may leave the arm anywhere
+        if op == "pick":
+            self.held = True                   # may be in the gripper from now on: not just after a pick finished
         try:
             await self.arm.do(op, rx, ry, rz)
         except Exception as e:  # CancelledError (STOP) isn't an Exception: it passes
@@ -562,6 +604,7 @@ class Runner:
         color, sx, sy = self.sc["slots"][slot]
         self.step = self.moving = None
         self.log("trial_start", slot=slot, color=color, **behavior, **({"verify_only": True} if verify_only else {}))
+        self.in_trial = True
         if not self.at_home:  # first trial, or after a stop / failure: the arm may be anywhere, maybe before a camera
             await self.move("home")
             self.step = None  # nothing of the trial itself has happened yet
@@ -588,6 +631,7 @@ class Runner:
         if p is None or p[0] != color:
             raise Unplanned(f"verify: no {color} piece at {self.target} spot {self.spot + 1} ({tx:.0f}, {ty:.0f})")
         self.log("trial_end", placed=self.target, correct=self.target == color)
+        self.in_trial = False
 
     async def trials(self, first, interrupted):
         """Trials first.. to the end. interrupted: trial `first` was cut off (STOP, restart); the operator decides."""
@@ -596,7 +640,8 @@ class Runner:
             slot = sc["order"][i - 1]
             behavior = sc["script"].get(i, {"behavior": "correct"})
             self.log.trial, self.status = i, f"trial {i}/{len(sc['order'])}: {slot}"
-            if i == first and interrupted:
+            # an interrupted but never begun trial (crashed or stopped between trials) just runs it normally
+            if i == first and interrupted and self.in_trial:
                 go = await self.operator(slot, self.interrupted)
             else:
                 self.log.attempt = 1
@@ -638,6 +683,7 @@ class Runner:
     def start(self):
         if self.state == "ready":
             self.state = "running"  # now, not when the task first runs: a second click must not start a second one
+            self.stop_problem = None    # a STOP pressed before the session (link down): the operator has moved on
             self.task = asyncio.create_task(self.run())
 
     def stop(self):
@@ -646,12 +692,43 @@ class Runner:
         self.log("stop", source="operator", step=self.step, moving=self.moving, sent=sent)
         if self.task and not self.task.done():
             self.task.cancel()
-            self.state, self.status = "stopped", f"STOPPED at trial {self.log.trial}"
+            self.state = "stopped"
+            # the stop isn't real until arm_node confirms the cancellation; until it answers, resume waits
+            self.status = f"STOPPED at trial {self.log.trial}" + (" (confirming at the arm…)" if sent else "")
+        if sent:
+            self.confirming = asyncio.create_task(self.confirm_stop())
+        else:
+            self.stop_not_confirmed("stop was not sent")     # the red link-warning situation already says so
+
+    def stop_not_confirmed(self, reason):
+        """The operator must not trust the STOP: the arm may still be moving. Only Resume (once the confirm
+        answer came or timed out) carries on, logging the problem."""
+        self.stop_problem = reason
+        self.status = f"STOP NOT CONFIRMED at trial {self.log.trial}: {reason}"
+
+    async def confirm_stop(self):
+        """The node's answer to the last stop: "done" (cancelled, or already finished, or nothing ran) or a
+        failure with the reason. Logged either way; a broken confirm path counts as not confirmed."""
+        try:
+            confirmed, reason = await self.arm.stop_confirm()
+        except Exception as e:
+            confirmed, reason = False, f"stop confirm failed: {e}"
+        self.log("stop_confirm", confirmed=confirmed, reason=reason)
+        if confirmed:
+            self.stop_problem = None
+            if self.state == "stopped":
+                self.status = f"STOPPED at trial {self.log.trial}"
+        else:
+            self.stop_not_confirmed(reason)
 
     def resume(self):
         if self.state == "stopped":
+            if self.confirming and not self.confirming.done():
+                return              # the stop is still being confirmed: don't continue on an unverified arm
             self.state = "running"
-            self.log("resume")
+            # the operator pressed Resume over a failed confirm: the log says so
+            self.log("resume", **({"stop_problem": self.stop_problem} if self.stop_problem else {}))
+            self.stop_problem = None
             # trial 0: stopped after the last trial, while saying "done"
             first = self.log.trial or len(self.sc["order"]) + 1
             self.task = asyncio.create_task(self.run(first, interrupted=True))
@@ -802,6 +879,8 @@ def panel(runner, title, host, speech=None):
                 status = ui.label().classes("text-lg ml-4")
             link = ui.label("ARM LINK DOWN: STOP can't reach the arm. Use the power / torque switch.") \
                 .classes("text-lg font-medium text-red-400")
+            stoprisk = ui.label("STOP NOT CONFIRMED: the arm may still be moving. Use the power / torque switch.") \
+                .classes("text-lg font-medium text-red-400")
 
         with ui.row().classes("w-full gap-4 items-stretch"):
             with ui.card().classes("p-3 w-96"):
@@ -843,6 +922,7 @@ def panel(runner, title, host, speech=None):
             state.props(f"color={STATE_COLORS.get(runner.state, 'grey')}")
             start.enabled = startable()
             link.visible = not getattr(runner.arm, "connected", True)
+            stoprisk.visible = runner.stop_problem is not None
             status.text = runner.status
             prompt.text = f'{p["text"]}  ({time.monotonic() - p["since"]:.0f} s)' if p else ""
             problems = runner.voice_problem.split("; ") if runner.voice_problem else []   # the full list is in the log
@@ -1056,6 +1136,7 @@ def self_test():
                 await r.task
             except asyncio.CancelledError:
                 pass
+            await r.confirming          # the fake arm confirms at once; explicit for determinism
             assert r.state == "stopped" and r.log.trial == 3, (r.state, r.log.trial)
             r.resume()
             await r.task
@@ -1127,6 +1208,181 @@ def self_test():
         ev = events(r)
         assert sorted(e["trial"] for e in ev if e["event"] == "trial_end") == list(range(1, len(r.sc["order"]) + 1))
         assert last(ev, "session_end") == [{"status": "done"}] and len({e["run"] for e in ev}) == 2
+
+        # a stop whose confirm fails: stop_confirm says so, the status and the panel flag carry the warning, and
+        # Resume carries on, logging stop_problem in the resume event and clearing it
+        class StopFailsConfirm(FakeArm):
+            def __init__(self):
+                self.places = 0
+
+            async def do(self, op, x=None, y=None, z=None):
+                self.places += op == "place"
+                if op == "place" and self.places == 3:
+                    r.stop()   # the cancellation lands at the next await
+                await asyncio.sleep(0)
+
+            async def stop_confirm(self):
+                return False, "the controller would not cancel the goal"
+
+        async def stop_fail_resume():
+            r.start()
+            try:
+                await r.task
+            except asyncio.CancelledError:
+                pass
+            await r.confirming
+            assert r.state == "stopped" and r.stop_problem, (r.state, r.stop_problem)
+            assert "STOP NOT CONFIRMED" in r.status, r.status
+            c = last(events(r), "stop_confirm")
+            assert c and c[-1] == {"confirmed": False, "reason": "the controller would not cancel the goal"}, c
+            r.resume()
+            await r.task
+        r = Runner(f"T{len(os.listdir(tmp))}", "correct", StopFailsConfirm(), world, tmp, auto=put_back, audio=False)
+        world.reset()
+        asyncio.run(stop_fail_resume())
+        ev = events(r)
+        assert r.state == "done" and r.stop_problem is None and last(ev, "session_end") == [{"status": "done"}]
+        assert last(ev, "resume") == [{"stop_problem": "the controller would not cancel the goal"}]
+        assert len(last(ev, "trial_end")) == len(r.sc["order"])
+
+        # resume does nothing at all while the stop's confirmation is still pending
+        class StopsAndWaitsConfirm(FakeArm):
+            def __init__(self):
+                self.gate, self.places = None, 0
+
+            async def do(self, op, x=None, y=None, z=None):
+                self.places += op == "place"
+                if op == "place" and self.places == 3:
+                    r.stop()   # the cancellation lands at the next await
+                await asyncio.sleep(0)
+
+            async def stop_confirm(self):
+                await self.gate.wait()
+                self.gate = None
+                return True, None
+
+        async def resume_blocked():
+            gate = asyncio.Event()
+            r.arm.gate = gate
+            r.start()
+            try:
+                await r.task
+            except asyncio.CancelledError:
+                pass
+            assert r.state == "stopped" and r.confirming and not r.confirming.done()
+            n = len(r.log.tail)
+            r.resume()                     # must be a no-op: the stop isn't verified yet
+            assert r.state == "stopped" and len(r.log.tail) == n and r.task.cancelled()
+            gate.set()
+            await r.confirming             # confirmed now: resume (the same button) may proceed
+            assert r.stop_problem is None
+            before = len(r.log.tail)
+            r.resume()
+            await r.task
+            assert len(r.log.tail) > before
+        r = Runner(f"T{len(os.listdir(tmp))}", "correct", StopsAndWaitsConfirm(), world, tmp, auto=put_back,
+                   audio=False)
+        world.reset()
+        asyncio.run(resume_blocked())
+        assert r.state == "done" and last(events(r), "session_end") == [{"status": "done"}]
+
+        # a pick that fails after dispatch: the piece may be in the gripper, so the prompt offers open gripper
+        # (live), and the same after a replay of a run stopped mid-pick
+        class PickFails(FakeArm):
+            async def do(self, op, x=None, y=None, z=None):
+                if op == "pick":
+                    raise RuntimeError("controller error")
+                await asyncio.sleep(0)
+        offered = []
+        r, ev = run("correct", lambda k, o: offered.append(o) or ("open gripper" if "open gripper" in o else "skip"),
+                    arm=PickFails())
+        assert offered and offered[0] == ("retry", "skip", "abort", "open gripper"), offered
+        # every failed pick offers it once; once it was used, the next prompt has nothing to open
+        assert len(offered) == 2 * len(r.sc["order"]) and offered[-1] == ("retry", "skip", "abort"), offered
+        assert all(("open gripper" in o) == (i % 2 == 0) for i, o in enumerate(offered)), offered
+        assert last(ev, "trial_end")[0] == {"skipped": True, "step": "open", "moving": None}
+        assert r.held is False
+
+        class StopsAtPick(FakeArm):
+            async def do(self, op, x=None, y=None, z=None):
+                if op == "pick":
+                    r.stop()   # before arm_done: the log says pick was sent, not that it finished
+                await asyncio.sleep(0)
+
+        def retry_answers(kind, opts):
+            if kind == "operator":
+                offered.append(opts)
+                return "retry"
+            return "yes"
+        r = Runner(f"T{len(os.listdir(tmp))}", "correct", StopsAtPick(), world, tmp, auto=retry_answers,
+                   audio=False)
+        world.reset()
+
+        async def quit_at_pick():
+            r.start()
+            try:
+                await r.task
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(quit_at_pick())
+        name = r.log.participant
+        r.log.f.close()
+        r = Runner(name, "correct", FakeArm(), world, tmp, auto=retry_answers, audio=False)
+        assert r.state == "stopped" and r.held and r.moving == "pick", (r.state, r.held, r.moving)
+        asyncio.run(resume())
+        ev = events(r)
+        # a trial_start was logged but no trial_end: the operator is asked about the interrupted trial
+        assert offered and "open gripper" in offered[-1], offered
+        assert last(ev, "operator_override")[0]["choice"] == "retry"
+        assert r.state == "done" and last(ev, "session_end") == [{"status": "done"}]
+
+        # a crash between trials (trial_end logged, no trial_start after it): resume just runs the next trial,
+        # with attempt 1, no operator prompt and no skipped record
+        def half_log(participant, recs):
+            """An earlier run_id's session: session_start and recs, no session_end (the process died)."""
+            run_id = "half"
+            path = Path(tmp) / f"{participant}_correct.jsonl"
+            base = {"t_wall": "2024-01-01T00:00:00.000+00:00", "t_mono": 1.0, "participant": participant,
+                    "condition": "correct", "run": run_id}
+            path.write_text("\n".join(json.dumps(base | {"trial": r["t"], "attempt": r.get("a", 1),
+                                                        "event": r["event"], "data": r.get("d", {})})
+                                      for r in [dict(event="session_start", t=0)] + recs) + "\n")
+            return run_id
+        name = f"T{len(os.listdir(tmp))}"
+        half_log(name, [dict(event="trial_start", t=1, d={"slot": r.sc["order"][0], "color": "red"}),
+                        dict(event="arm_cmd", t=1, d={"op": "pick"}),
+                        dict(event="arm_done", t=1, d={"op": "pick"}),
+                        dict(event="vision", t=1, d={"tag": "before", "pieces": []}),
+                        dict(event="trial_end", t=1, d={"placed": "red", "correct": True})])
+        world.reset()
+        r = Runner(name, "correct", FakeArm(), world, tmp, auto=lambda k, o: "yes", audio=False)
+        assert r.state == "stopped" and r.log.trial == 2 and not r.in_trial, (r.state, r.log.trial)
+        asyncio.run(resume())
+        ev = events(r)
+        resumed = [e for e in ev if e["run"] != "half"]
+        assert last(resumed, "resume") == [{}]
+        assert not last(ev, "operator_override") and not any(t.get("skipped") for t in last(ev, "trial_end"))
+        n = len(r.sc["order"])
+        starts = [e for e in ev if e["event"] == "trial_start"]
+        assert [e["trial"] for e in starts] == list(range(1, n + 1)) and [e["attempt"] for e in starts] == [1] * n
+        assert r.state == "done" and last(resumed, "session_end") == [{"status": "done"}]
+
+        # the answer to an earlier stop (a timed-out command's) must not confirm the operator's later STOP
+        published = []
+
+        class RosStub:      # RosArm's roslibpy side: connected, and publish just records
+            is_connected, Message, publish = True, staticmethod(dict), staticmethod(published.append)
+
+        async def latest_stop_counts():
+            arm = RosArm.__new__(RosArm)
+            arm.ros = arm.cmd = arm.roslibpy = RosStub
+            arm.waiting, arm.n, arm.last_stop, arm.nonce = {}, 0, None, "test"
+            assert arm.stop() and arm.stop()
+            first, second = (json.loads(m["data"])["id"] for m in published)
+            arm.on_status({"data": json.dumps({"id": first, "state": "done"})})
+            arm.on_status({"data": json.dumps({"id": second, "state": "failed", "reason": "rejected"})})
+            assert await arm.stop_confirm() == (False, "rejected") and not arm.waiting
+        asyncio.run(latest_stop_counts())
 
         # with the voice on, a question nobody could hear is unplanned, not an answer
         which = shutil.which
@@ -1218,8 +1474,9 @@ def main():
                     "arm's moves) or the real cameras")
     ap.add_argument("--arm", choices=["ros", "fake"], default="ros")
     ap.add_argument("--host", default="localhost", help="rosbridge host (port 9090)")
-    ap.add_argument("--panel-host", default="127.0.0.1", help="operator panel address (0.0.0.0: reachable from "
-                                                               "the network)")
+    ap.add_argument("--panel-host", default="127.0.0.1", help="operator panel address (the panel has no "
+                                                             "authentication: only use a loopback host unless the "
+                                                             "lab's network is one you trust with the controls)")
     ap.add_argument("--lang", choices=["en", "hu"], default="en", help="language the participant answers in")
     ap.add_argument("--no-speech", action="store_true", help="answers through the panel buttons only")
     ap.add_argument("--mic", type=int, help="input device for spoken answers (speech.py --list-devices)")
@@ -1251,6 +1508,10 @@ def main():
                 voice=not args.no_voice)
     runner = Runner(args.participant, condition, arm, vision, audio=not args.no_voice, info=info)
     speech = None if args.no_speech else Speech(runner, args.lang, device=args.mic)
+    if args.panel_host not in ("127.0.0.1", "localhost", "::1"):   # loopback: present but unreachable remotely
+        print(f"WARNING: --panel-host {args.panel_host} serves the operator panel to anyone who can reach this "
+              "machine: the panel has no authentication and can control the experiment and the robot.",
+              file=sys.stderr)
     panel(runner, f"{args.participant} · block {args.block}/{len(conditions)} · {condition}", args.panel_host, speech)
 
 
