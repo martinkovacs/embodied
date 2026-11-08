@@ -76,10 +76,12 @@ images in `synthetic/` and are tracked as the arm moves them, because nothing re
 `--arm fake` runs the same without ROS at all. `--vision` is required, so a real-arm run can't silently use the
 synthetic images; `--vision cameras` refuses a scenario that still points at the synthetic layout.
 
-**The robot's voice** comes from recorded WAVs in `audio/` (`ask_red.wav`, `ask_blue.wav`, `ask_green.wav`,
-`ask_white.wav`, `which.wav`, `done.wav`), played with `pw-play` / `paplay` / `aplay` / `afplay`. Until they're
-recorded, macOS `say` stands in; elsewhere the panel shows in red which lines can't be spoken, and every
-`robot_say` event logs `spoken: false`. A question the robot couldn't speak stops the trial as unplanned (an
+**The robot's voice** comes from the WAVs in `audio/` (`ask_red.wav`, `ask_blue.wav`, `ask_green.wav`,
+`ask_white.wav`, `which.wav`, `done.wav`), played with `pw-play` / `paplay` / `aplay` / `afplay`. They were generated
+with [magpie-tts.cpp](https://github.com/mudler/magpie-tts.cpp) at commit `3008ff7` and NVIDIA's Magpie TTS
+Multilingual 357M (`magpie-tts-multilingual-357m-q8_0.gguf`, `--lang en --speaker Aria --seed 42`), then trimmed at
+-45 dBFS, faded and peak-normalized to -3 dBFS. If a WAV is missing, macOS `say` stands in; elsewhere the panel shows
+in red which lines can't be spoken, and every `robot_say` event logs `spoken: false`. A question the robot couldn't speak stops the trial as unplanned (an
 answer to a question nobody heard isn't data); `--no-voice` runs silent on purpose (development, or the
 experimenter reads the questions) and is logged. Trim the silence at the end of each WAV: reaction times are
 measured from the end of playback. `--lang` only switches speech recognition; the recordings stay as recorded.
