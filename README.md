@@ -123,7 +123,7 @@ docker exec -d -e DISPLAY=:1 robot-arm bash -c 'source /opt/ros/humble/setup.bas
 - `logs/<participant>_<condition>.jsonl`: one event per line, each with the run id and attempt
   (`session_start` with the run settings, `trial_start`, `vision`, `arm_cmd`, `spot` (zone spot reserved /
   released), `robot_say` with `spoken`, `participant_answer` with `rt_s` / `rt_from` / `source`, `speech`
-  (every transcript), `unplanned`, `operator_override`, `stop` / `resume`, `trial_end`, …). Camera images and
+  (every transcript), `unplanned`, `operator_override`, `stop` / `stop_confirm` / `resume`, `trial_end`, …). Camera images and
   speech audio go to `logs/<participant>_<condition>/<run>/`, so a rerun never overwrites them. `logs/` is
   gitignored: it's participant data.
 - If the runner quits or crashes mid-block, starting it again with the same participant and block finds the

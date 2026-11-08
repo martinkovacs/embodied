@@ -5,18 +5,24 @@
              op: pick | place (x, y, z) | show | home | open | stop
 /arm/status  std_msgs/String JSON  {"id": 7, "state": "started" | "done" | "failed", "reason": "..."}
 
-One command at a time: another one arriving meanwhile fails with "busy". stop answers "done" at once and cancels
-the running motion: the arm holds where it is and the running command fails with "stopped". Every controller
-answer is timed out (goal 5 s; arm result, trajectory duration + 5 s; gripper result 5 s): a controller that
-never answers (USB dropout) fails the command instead of leaving the node busy for ever.
+One command at a time: another one arriving meanwhile fails with "busy". stop cancels the running motion and
+only answers "done" once the cancellation is confirmed (the controller accepts it, or the goal had already
+terminated, or nothing was running); otherwise it answers "failed" and the reason (rejected / no answer):
+the operator must then assume the arm may still be moving and use the power switch. The running command fails
+with "stopped" either way. Every controller answer is timed out (goal acceptance 5 s; arm result, trajectory
+duration + 5 s; gripper result 5 s; cancel 2 s): a controller that never answers (USB dropout) fails the
+command instead of leaving the node busy for ever.
 
 Run after the ROBOTIS bringup (hardware.launch.py or gazebo.launch.py):  ros2 run arm_node arm_node
 """
 import json
+import time
 from math import isfinite
 
 import rclpy
+import rclpy.task
 from action_msgs.msg import GoalStatus
+from action_msgs.srv import CancelGoal
 from control_msgs.action import FollowJointTrajectory, GripperCommand
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -35,8 +41,10 @@ EMPTY_MARGIN = 0.002            # m: tune in the lab: a grasp stalls above CLOSE
 MAX_SPEED = 0.6                 # rad/s, for the joint that moves most
 MIN_MOVE_S = 1.0
 GOAL_ACCEPT_S = 5.0             # a live controller answers this fast
+CANCEL_ACK_S = 2.0              # stop: how long the controller may take to answer its cancel request
 RESULT_EXTRA_S = 5.0            # arm goal result: trajectory duration + this
 GRIP_RESULT_S = 5.0             # gripper goal result
+JOINT_STALE_S = 1.0             # /joint_states: without a reading fresher than this, nothing may move
 
 
 def trajectory(q_from, points):
@@ -68,9 +76,11 @@ class ArmNode(Node):
         self.gripper = ActionClient(self, GripperCommand, "/gripper_controller/gripper_cmd")
         self.status = self.create_publisher(String, "/arm/status", 10)
         self.q = None                   # current arm joints, from /joint_states
+        self.q_at = None                # time.monotonic() when the last valid q came in
         self.table_z = 0.0              # z of the table surface at the last pick/place spot
         self.op_xy = None               # (x, y) of the running (or last interrupted) pick/place: the lift home
         self.goal = None                # running controller goal, cancelled by stop
+        self.sending = None             # the goal request in flight, while its acceptance is awaited
         self.busy = self.stopped = False
         self.create_subscription(JointState, "/joint_states", self.on_joints, 10)
         # reentrant: a stop has to get through while a command is still awaiting the controllers
@@ -78,30 +88,82 @@ class ArmNode(Node):
 
     def on_joints(self, msg):
         pos = dict(zip(msg.name, msg.position))
-        # fail closed: a non-finite reading (USB dropout) must not become the node's picture of the arm
+        if not any(j in pos for j in JOINTS):
+            return                      # not about the arm (the gripper's broadcaster publishes too)
+        # fail closed: a partial or non-finite reading (USB dropout) must not become the node's picture of the arm
         if all(j in pos and isfinite(pos[j]) for j in JOINTS):
-            self.q = [pos[j] for j in JOINTS]
+            self.q, self.q_at = [pos[j] for j in JOINTS], time.monotonic()
+        else:
+            self.q = None               # the last full reading may predate the fault: don't move from it
+
+    def joints(self):
+        """The current joints, fail closed: RuntimeError without a valid reading younger than JOINT_STALE_S. A
+        stale picture (the controllers died mid-motion, a stop left the arm somewhere) must not become the
+        start of a trajectory, or the clearance checks would be solved against the wrong arm."""
+        if self.q is None:
+            raise RuntimeError("no valid /joint_states (all reported arm joints, all finite)")
+        if (age := time.monotonic() - self.q_at) > JOINT_STALE_S:
+            raise RuntimeError(f"/joint_states is {age:.1f} s old (over {JOINT_STALE_S:.0f} s)")
+        return self.q
 
     async def on_cmd(self, msg):
         cmd = {}
         try:
             cmd = json.loads(msg.data)
             if cmd["op"] == "stop":
-                self.stopped = True
-                if self.goal:
-                    self.goal.cancel_goal_async()
-            elif self.busy:
+                await self.on_stop(cmd)
+                return
+            if self.busy:
                 raise RuntimeError("busy")
-            else:
-                self.busy, self.stopped = True, False
-                try:
-                    self.reply(cmd, "started")
-                    await self.run(cmd)
-                finally:
-                    self.busy = False
+            self.busy, self.stopped = True, False
+            try:
+                self.reply(cmd, "started")
+                await self.run(cmd)
+            finally:
+                self.busy = False
             self.reply(cmd, "done")
         except Exception as e:  # bad command, out of reach, controller error, timeout, stopped
             self.reply(cmd, "failed", str(e))
+
+    async def on_stop(self, cmd):
+        """Stop cancels the running goal and answers once the cancellation is verified: "done" only when
+        nothing was running or the controller says it cancelled (or had already terminated); "failed" with
+        the reason otherwise, so the operator knows the arm may still be moving. Never raises: a stop has to
+        get through whatever else the node is doing, and it must be answered."""
+        self.stopped = True
+        try:
+            state, reason = await self._stop_outcome()
+        except Exception as e:          # failed timer, rclpy error: still answer, never raise into the spin
+            state, reason = "failed", f"stop: {e}"
+        self.reply(cmd, state, reason)
+
+    async def _stop_outcome(self):
+        handle = self.goal
+        if handle is None:
+            fut = self.sending          # a command is still awaiting acceptance: don't lose the stop here, or
+            if fut is None:             # its goal, if it lands at all, can never be cancelled and verified
+                return "done", None     # nothing running
+            try:                        # bounded like send()'s own acceptance wait, then cancel and verify
+                handle = await self.await_ft(fut, GOAL_ACCEPT_S, "goal acceptance")
+            except TimeoutError:
+                # send(), which owns the request, has failed and late-cancels it if it is accepted after all:
+                # nothing was ever confirmed though
+                return "failed", f"stop: goal acceptance still pending after {GOAL_ACCEPT_S:.0f} s"
+            except Exception:           # the request itself failed: nothing was accepted
+                return "done", None
+            if not handle.accepted:     # rejected: nothing is moving
+                return "done", None
+        res = await self.await_ft(handle.cancel_goal_async(), CANCEL_ACK_S, "cancel request")
+        code = CancelGoal.Response      # old-style names in Humble: the cancel answer's class
+        if res.return_code == code.ERROR_NONE and res.goals_canceling:
+            return "done", None         # the controller is cancelling the goal
+        if res.return_code == code.ERROR_GOAL_TERMINATED:
+            return "done", None         # already finished: the arm holds where the goal left it, not moving
+        if res.return_code == code.ERROR_NONE:  # accepted call but nothing to cancel: rejected upstream
+            return "failed", "stop: the controller would not cancel the goal (rejected or unknown goal id)"
+        why = {code.ERROR_REJECTED: "rejected", code.ERROR_UNKNOWN_GOAL_ID: "unknown goal id"}.get(
+            res.return_code, f"return code {res.return_code}")
+        return "failed", f"stop: the controller would not cancel the goal ({why})"
 
     def reply(self, cmd, state, reason=None):
         out = {"id": cmd.get("id") if isinstance(cmd, dict) else None, "state": state}
@@ -147,13 +209,11 @@ class ArmNode(Node):
 
     async def travel(self, q, table_z):
         """Travel move with a clearance check, lifting straight up first when the arm already sits low."""
-        if self.q is None:
-            raise RuntimeError("no /joint_states yet")
-        q_from = self.q
-        z = fk(self.q)[2]
+        q_from = self.joints()
+        z = fk(q_from)[2]
         if not (z >= table_z + CLEAR):          # fail closed on nan; a low arm (stop mid-descent or hand move)
             try:                                # first lifts, from the interrupted op's spot or its own column
-                lift = lift_path(self.q, table_z, self.op_xy)
+                lift = lift_path(q_from, table_z, self.op_xy)
             except ValueError as e:
                 raise RuntimeError(str(e)) from None
             await self.move(lift)               # one multi-point straight-up trajectory, not path-checked
@@ -166,9 +226,7 @@ class ArmNode(Node):
 
     async def move(self, points):
         """One multi-point trajectory from where the arm is (per /joint_states) through points."""
-        if self.q is None:
-            raise RuntimeError("no /joint_states yet")
-        pts, total = trajectory(self.q, points)
+        pts, total = trajectory(self.joints(), points)
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = JOINTS
         goal.trajectory.points = pts
@@ -189,15 +247,26 @@ class ArmNode(Node):
             raise RuntimeError("stopped")
         if not client.server_is_ready():
             raise RuntimeError("controller not running (ros2 control list_controllers)")
+        fut = client.send_goal_async(goal)
+        self.sending = fut                     # a stop before acceptance waits for this answer too
         try:
-            handle = await self.await_ft(client.send_goal_async(goal), GOAL_ACCEPT_S, f"{what} acceptance")
+            handle = await self.await_ft(fut, GOAL_ACCEPT_S, f"{what} acceptance")
         except TimeoutError as e:
+            def cancel_late(f):                # a goal accepted this late must not move the arm for a command
+                try:                           # whose caller is already gone; a failed request has no handle
+                    if (h := f.result()).accepted:
+                        h.cancel_goal_async()
+                except Exception:
+                    pass
+            fut.add_done_callback(cancel_late)
             raise RuntimeError(str(e)) from None    # no handle yet: the goal request itself is dropped
+        finally:
+            self.sending = None                # settled either way: a later stop still sees self.goal
         if not handle.accepted:
             raise RuntimeError("goal rejected")
         self.goal = handle
-        if self.stopped:  # stop came in while the goal was being sent
-            handle.cancel_goal_async()
+        # no cancel here: stop owns the cancel requests (a stop before or during acceptance has just done
+        # one). whatever a stop did, the command fails with "stopped" if the goal so much as reaches the end.
         try:
             res = await self.await_ft(handle.get_result_async(), result_timeout, f"{what} result")
         except TimeoutError as e:
@@ -212,9 +281,9 @@ class ArmNode(Node):
     async def await_ft(self, fut, timeout, what):
         """Await an rclpy future with a timeout (rclpy coroutines can't use asyncio): a one-shot timer races
         the future and whichever finishes first settles the shared future. TimeoutError on a silent controller."""
-        done = self.create_future()
+        done = rclpy.task.Future(executor=self.executor)
 
-        def settle():
+        def settle(*_):                 # future callbacks are called with the future, timers' with nothing
             if not done.done():
                 done.set_result(None)
 
@@ -224,7 +293,7 @@ class ArmNode(Node):
             await done
         finally:
             timer.cancel()
-            timer.destroy()
+            self.destroy_timer(timer)   # through the node: Timer.destroy() would stay in its timer list
         if not fut.done():
             raise TimeoutError(f"{what}: no answer from the controller in {timeout:.0f} s")
         return fut.result()

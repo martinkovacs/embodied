@@ -79,7 +79,7 @@ WORDS = {   # answers -> words / phrases per language; multi-word = consecutive 
 }
 NEGATORS = frozenset(("not", "never", "nem", "dehogy"))
 UNCERTAIN = ("don t know", "do not know", "not sure", "no idea", "maybe", "perhaps", "talán", "talan",
-             "lehet", "nem tudom", "nem vagyok biztos", "fogalmam sincs")   # said at all: no answer
+             "lehet", "nem tudom", "nem vagyok biztos", "nem biztos", "fogalmam sincs")   # said at all: no answer
 
 
 class SpeechUnavailable(Exception):
@@ -89,6 +89,12 @@ class SpeechUnavailable(Exception):
 def _words(text):
     """One lowercase clause string -> tokens: 'it s blue' -> [it, s, blue]."""
     return "".join(c if unicodedata.category(c)[0] == "L" else " " for c in text).split()
+
+
+# Hungarian "nem" is both the answer "no" and the ordinary negator: it only answers on its own or right
+# before one of these ("nem az", "nem igaz", "nem piros"); anywhere else ("nem emlékszem") it is grammar
+HU_NEM_NEXT = frozenset(("az",)) | frozenset(
+    t for k in ("yes",) + COLORS for w in WORDS["hu"][k] for t in _words(w))
 
 
 def _clauses(text):
@@ -115,26 +121,38 @@ def _scan(clauses, tokens):
     return plain, negated
 
 
+def _nem_answers(clauses):
+    """A clausal Hungarian "nem" is the answer "no" when it stands alone ("Nem.") or is immediately
+    followed by az / a colour / a yes-word; before anything else it is the ordinary negator
+    ("nem emlékszem", "nem látom") and answers nothing — the operator decides."""
+    return any(w == ["nem"] or any(w[i + 1] in HU_NEM_NEXT for i, t in enumerate(w[:-1]) if t == "nem")
+               for w in clauses)
+
+
 def match(text: str, options: Sequence[str], language: str, asked=None) -> str | None:
     """The one awaited answer the transcript points to, else None (the operator decides).
 
     A negated yes-word counts as "no" ('not right', 'nem igaz'); words of doubt mean no answer at all;
-    with `asked` given (yes/no question), a yes plus a different un-negated colour contradicts -> None,
-    while a no beside any colour stays "no".
+    with `asked` given (yes/no question), a plain yes beside the asked colour negated ("Yes, not red")
+    or a different un-negated colour contradicts -> None, while a no beside any colour stays "no".
     """
     clauses = _clauses(text)
     if any(_scan(clauses, _words(u))[0] for u in UNCERTAIN):
         return None
-    plain = {}                          # answer -> one of its phrases is left standing
+    plain, negated = {}, {}             # answer -> one of its phrases is left standing / is negated
     for option, phrases in WORDS[language].items():
         for phrase in phrases:
-            found, negated = _scan(clauses, _words(phrase))
+            if language == "hu" and phrase == "nem" and not _nem_answers(clauses):
+                continue                # the grammar negator ("nem emlékszem"), not the answer
+            found, hit_negated = _scan(clauses, _words(phrase))
             plain[option] = plain.get(option, False) or found
-            if negated and option == "yes":
+            negated[option] = negated.get(option, False) or hit_negated
+            if hit_negated and option == "yes":
                 plain["no"] = True      # "not right" denies the yes: no, not silence
-    if asked is not None and plain.get("yes") and any(plain.get(c) for c in COLORS if c != asked):
-        return None                     # "yes, it's <another colour>" cannot answer this question
-    hits = {o for o in options if plain.get(o)}
+    if asked is not None and plain.get("yes") and (negated.get(asked) or any(plain.get(c)
+            for c in COLORS if c != asked)):
+        return None                     # yes beside a negated asked colour / another colour: no answer
+    hits = {o for o in options if plain.get(o)}     # a plain no beside any colour stays "no"
     return next(iter(hits)) if len(hits) == 1 else None
 
 
@@ -791,11 +809,22 @@ def self_test():
     assert m("Yes, it's red", y_n, "en", asked="red") == "yes"
     assert m("Yes, it's blue", y_n, "en", asked="red") is None
     assert m("No, it's blue", y_n, "en", asked="red") == "no"  # a no beside any colour stays no
+    assert m("Yes, not red", y_n, "en", asked="red") is None   # a plain yes + the asked colour negated
+    assert m("No, not red", y_n, "en", asked="red") == "no"
+    assert m("Yes, not blue", y_n, "en", asked="red") == "yes"  # only the asked colour counts there
     assert m("Jó, de kék", y_n, "hu", asked="red") is None
     # the still-good basics
     assert m("Igen.", y_n, "hu") == "yes" and m("Nem.", y_n, "hu") == "no" and m("Persze", y_n, "hu") == "yes"
     assert m("így van", y_n, "hu") == "yes" and m("igy van", y_n, "hu") == "yes"
     assert m("Rossz!", y_n, "hu") == "no" and m("Nem az", y_n, "hu") == "no"
+    # Hungarian "nem" answers only alone or before az / a colour / a yes-word; elsewhere (with a verb
+    # after it) it is the ordinary negator and matches nothing, so the operator decides
+    assert m("igen", y_n, "hu") == "yes" and m("Nem, kék.", y_n, "hu") == "no"
+    assert m("nem igaz", y_n, "hu") == "no" and m("nem az", y_n, "hu") == "no"
+    assert m("nem emlékszem", y_n, "hu") is None and m("nem látom", y_n, "hu") is None
+    assert m("Nem biztos.", y_n, "hu") is None and m("nem biztos", y_n, "hu") is None
+    assert m("Biztos nem", y_n, "hu") is None  # not via UNCERTAIN ("nem biztos"): no "nem"-answer here
+    assert m("Nem, nem piros, kék", colours, "hu") == "blue"    # a colour question: negated colours are no hits
     for opt, said in (("blue", "kék"), ("blue", "kek"), ("green", "zöld"), ("green", "zold"),
                       ("white", "fehér"), ("white", "feher"), ("red", "piros"), ("red", "voros")):
         assert m(said, (opt,) + colours, "hu") == opt, said
