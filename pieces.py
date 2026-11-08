@@ -239,6 +239,28 @@ def view_from_calib(calib, camera="left", table_offset_mm=0.0, ppm=2.0):
     return TopView(cam.K, cam.dist, T, z_mm=PIECE_H_MM - table_offset_mm, ppm=ppm, image_size=cam.image_size)
 
 
+def matched_pieces(calib, left_pieces, right_pieces, max_mm=15.0):
+    """Pair left/right detections (same colour, close on the table) and triangulate their top centres.
+
+    Returns [(left Piece, table xyz or None)]: the stereo position as an (x, y, z) ndarray in table
+    mm, None for a left detection with no right partner.
+    """
+    rows, used = [], set()
+    for p in left_pieces:
+        best = None
+        for j, q in enumerate(right_pieces):
+            d = np.hypot(p.table_mm[0] - q.table_mm[0], p.table_mm[1] - q.table_mm[1])
+            if q.color == p.color and j not in used and d < max_mm and (best is None or d < best[1]):
+                best = (j, d)
+        stereo = None
+        if best is not None:
+            used.add(best[0])
+            X = calib.triangulate(np.array([p.image_uv]), np.array([right_pieces[best[0]].image_uv]))
+            stereo = calib.to_table(X)[0]
+        rows.append((p, stereo))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("images", nargs="+")

@@ -11,7 +11,6 @@ Run:  venv/bin/python calib_gui.py             (opens its own app window, dark m
       venv/bin/python calib_gui.py --browser   (only serve on http://localhost:8080)
 """
 import base64
-import glob
 import json
 import shutil
 import subprocess
@@ -28,64 +27,13 @@ from nicegui import app, run, ui
 
 import pieces
 import stereo_calib as sc
+from cameras import CALIB_PATH, DATA, SETTINGS_PATH, STAGES, TEST_FILES, Source, load_settings
 
-DATA = Path("calib_data")
 PAIRS = DATA / "pairs"
-CALIB_PATH = DATA / "calib.json"
-SETTINGS_PATH = DATA / "settings.json"
 PREVIEW_W = 640
-ROOT = Path(__file__).resolve().parent
-# Test mode: image files stand in for the cameras, one left/right set per step (paths relative to ROOT).
-STAGES = {"calib": "Calibration pairs", "table": "Table pose", "scene": "Detection scene"}
-TEST_FILES = {"calib": ("synthetic/calib/left_*.png", "synthetic/calib/right_*.png"),
-              "table": ("synthetic/table_left.png", "synthetic/table_right.png"),
-              "scene": ("synthetic/scene_left.png", "synthetic/scene_right.png")}
-DEFAULTS = {"left": "0", "right": "1", "width": 1280, "height": 960,
-            "cols": 9, "rows": 6, "square_mm": 25.0, "board_mm": 0.0, "test_mode": False,
-            **{f"test_{st}_{side}": TEST_FILES[st][i] for st in STAGES for i, side in enumerate(("left", "right"))}}
 PORT = 8080
 BROWSERS = ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "brave", "microsoft-edge-stable")
 HEX = {"red": "#e53935", "blue": "#1e40af", "green": "#2e9d4f", "white": "#f5f5f5"}
-
-
-class Source:
-    """A camera (spec is an index) or a sorted list of image files (spec is a glob)."""
-
-    def __init__(self, spec: str, width: int, height: int):
-        self.spec = spec.strip()
-        self.cap, self.files, self.idx = None, [], 0
-        if self.spec.isdigit():
-            self.cap = cv2.VideoCapture(int(self.spec))
-            if not self.cap.isOpened():
-                raise RuntimeError(f"cannot open camera {self.spec}")
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        else:
-            pattern = self.spec if Path(self.spec).is_absolute() else str(ROOT / self.spec)
-            self.files = sorted(glob.glob(pattern))
-            if not self.files:
-                raise RuntimeError(f"no images match {self.spec}")
-
-    @property
-    def is_folder(self):
-        return self.cap is None
-
-    def grab(self):
-        if self.cap is not None:
-            self.cap.grab()
-
-    def retrieve(self):
-        if self.cap is not None:
-            ok, frame = self.cap.retrieve()
-            return frame if ok else None
-        return cv2.imread(self.files[self.idx])
-
-    def label(self):
-        return f"camera {self.spec}" if self.cap is not None else f"{self.idx + 1}/{len(self.files)} {Path(self.files[self.idx]).name}"
-
-    def release(self):
-        if self.cap is not None:
-            self.cap.release()
 
 
 @dataclass
@@ -102,7 +50,7 @@ class State:
     def __init__(self):
         DATA.mkdir(exist_ok=True)
         PAIRS.mkdir(exist_ok=True)
-        self.settings = {**DEFAULTS, **(json.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {})}
+        self.settings = load_settings()
         self.sources = {}  # stage -> (left, right); with cameras every stage shares the same pair
         self.lock = threading.Lock()
         self.pairs: list[Pair] = []
@@ -216,24 +164,6 @@ def rectified_pair(left, right):
     return both
 
 
-def matched_pieces(left_pieces, right_pieces, max_mm=15.0):
-    """Pair left/right detections (same colour, close on the table) and triangulate their top centres."""
-    rows, used = [], set()
-    for p in left_pieces:
-        best = None
-        for j, q in enumerate(right_pieces):
-            d = np.hypot(p.table_mm[0] - q.table_mm[0], p.table_mm[1] - q.table_mm[1])
-            if q.color == p.color and j not in used and d < max_mm and (best is None or d < best[1]):
-                best = (j, d)
-        stereo = None
-        if best is not None:
-            used.add(best[0])
-            X = S.calib.triangulate(np.array([p.image_uv]), np.array([right_pieces[best[0]].image_uv]))
-            stereo = S.calib.to_table(X)[0]
-        rows.append((p, stereo))
-    return rows
-
-
 # ---------- workers (run in a thread) ----------
 
 def capture_pair(left, right):
@@ -301,7 +231,7 @@ def capture_table(left, right):
 def detect_both(left, right):
     vl, vr = S.views
     pl, pr = pieces.detect_pieces(left, vl), pieces.detect_pieces(right, vr)
-    return pl, pr, pieces.draw(left, pl, vl), pieces.draw(right, pr, vr), matched_pieces(pl, pr)
+    return pl, pr, pieces.draw(left, pl, vl), pieces.draw(right, pr, vr), pieces.matched_pieces(S.calib, pl, pr)
 
 
 # ---------- UI ----------

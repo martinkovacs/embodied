@@ -1,6 +1,7 @@
 # Layout for the synthetic scene (synthetic/scene_*.png): slots are where pieces.py finds the reachable pieces
 # there. The real lab layout is a printed template with marked slots and zone spots, written the same way.
-# All positions: table frame mm (calib_data/calib.json). runner.py checks that the arm reaches every one.
+# All positions: table frame mm (calib_data/calib.json). runner.py checks that the arm reaches every one,
+# travels between them clear of the table, spots >= 40 mm apart, and enough spots per zone.
 robot_frame: synthetic/robot_frame.json
 slots:            # id: [colour, x, y]
   r1: [red, 196.2, -0.8]
@@ -16,8 +17,11 @@ slots:            # id: [colour, x, y]
   g1: [green, 231.8, -64.1]
   g2: [green, 47.7, -132.5]
   g3: [green, 13.9, -124.2]
-zones:            # colour: spots in the order they fill up, [x, y]
-  red:   [[230, 30], [270, 30], [300, 30], [230, 70], [270, 70], [300, 70]]
-  blue:  [[-100, 30], [-70, 30], [-30, 30], [-100, 70], [-70, 70], [-30, 70]]
-  green: [[220, 110], [260, 110], [220, 150], [260, 150]]
-  white: [[-60, 110], [-20, 110], [-60, 150], [-20, 150]]
+zones:            # colour: spots in the order they fill up, [x, y]; room for the worst case of every scenario
+  red:   [[230, 30], [270, 30], [310, 30], [230, 70], [270, 70], [190, 70], [270, -10], [150, 110], [110, 110]]
+  blue:  [[10, 30], [-70, 30], [-30, 30], [10, 70], [-70, 70], [-30, 70]]
+  green: [[220, 110], [260, 110], [220, 150], [260, 150], [180, 150], [140, 150], [180, 190], [140, 190]]
+  white: [[-60, 110], [-20, 110], [-60, 150], [-20, 150], [20, 150]]
+# The synthetic renders put some pieces 34-36 mm apart (touching). The printed lab template must keep slots
+# 40 mm apart (the default) so the open fingers have room.
+min_slot_spacing_mm: 33
