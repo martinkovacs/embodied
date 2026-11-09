@@ -11,11 +11,11 @@ ask the participant (*"Is this red?"*). Everything is logged for the trust analy
 
 | Part | Where it runs | Files |
 |---|---|---|
-| Vision: 2 RGB cameras → piece colour + position in table mm | host (Mac / laptop) | `pieces.py`, `stereo_calib.py`, `calib_gui.py` |
+| Vision: 2 RGB cameras → piece colour + position in table mm | host (the lab PC) | `pieces.py`, `stereo_calib.py`, `calib_gui.py` |
 | Table → robot coordinates | host | `robot_frame.py`, `calib_data/robot_frame.json` |
 | Experiment: trial state machine, scenarios, log, operator panel | host | `runner.py`, `scenarios/`, `layouts/`, `participants.csv` |
 | Spoken answers: microphone → Silero VAD → Canary-1B-v2 (transcribe.cpp) | host | `speech.py`, `models/` |
-| Arm motions: `/arm/cmd` JSON → inverse kinematics → ROBOTIS controllers | ROS 2 (Docker or the lab Ubuntu PC) | `ros_ws/src/arm_node/` |
+| Arm motions: `/arm/cmd` JSON → inverse kinematics → ROBOTIS controllers | ROS 2 (the lab PC, or Docker for a rehearsal) | `ros_ws/src/arm_node/` |
 
 The host talks to ROS only through **rosbridge** (websocket, port 9090). That's why the same host code runs
 against the simulator, the ROBOTIS fake hardware, or the real arm: only `--host` changes.
@@ -74,7 +74,7 @@ venv/bin/python runner.py --participant P00 --block 1 --vision synthetic
 and open the operator panel at <http://localhost:8081>. Press **Start**. The pieces come from the synthetic
 images in `synthetic/` and are tracked as the arm moves them, because nothing really moves on fake hardware.
 `--arm fake` runs the same without ROS at all. `--vision` is required, so a real-arm run can't silently use the
-synthetic images; `--vision cameras` refuses a scenario that still points at the synthetic layout.
+synthetic images; `--vision cameras` always uses `layouts/lab.yaml`.
 
 **The robot's voice** comes from the WAVs in `audio/` (`ask_red.wav`, `ask_blue.wav`, `ask_green.wav`,
 `ask_white.wav`, `which.wav`, `done.wav`), played with `pw-play` / `paplay` / `aplay` / `afplay`. They were generated
@@ -117,8 +117,9 @@ docker exec -d -e DISPLAY=:1 robot-arm bash -c 'source /opt/ros/humble/setup.bas
 - `participants.csv`: each participant's conditions in running order (`--block 2` = their second one).
 - `scenarios/<condition>.yaml`: the slot order (the same in every condition) and which trials are `mistake`
   (with `put_to`) or `ask`. Unlisted trials are `correct`. **The trial numbers in there are placeholders.**
-- `layouts/*.yaml`: the printed table template: piece slots and zone spots in table mm, plus the robot frame
-  file. On start the runner checks that the arm reaches every slot and spot.
+- `scenarios/smoke.yaml` is four pieces for a first test and isn't part of the experiment.
+- `layouts/synthetic.yaml` (`--vision synthetic`) and `layouts/lab.yaml` (`--vision cameras`, written by
+  `lab_layout.py`): piece slots and zone spots in table mm, plus the robot frame file. On start the runner checks that the arm reaches every slot and spot.
 - `layouts/*.yaml`: on start the runner also checks that the arm travels between every slot, spot, home and
   show clear of the pieces, that zone spots are ≥ 40 mm apart, and that each zone has room for the worst
   case (an asked participant may name any colour).
@@ -141,25 +142,18 @@ because that would contaminate the conditions. **STOP** halts the arm (and the r
 
 ## 4. In the lab (real arm, real cameras)
 
-The arm is plugged into the lab's Ubuntu PC (U2D2 adapter, `/dev/ttyUSB0`), which runs ROS. The laptop with
-the cameras runs everything else and reaches the PC over the network.
+Everything runs on the lab PC: the arm, the cameras, the runner and the panel. **[`LAB_GUIDE.md`](LAB_GUIDE.md) is the
+step-by-step for a first session.** `lab.sh` wraps the commands: `./lab.sh setup` once, `./lab.sh arm` to start the
+ROS side, `./lab.sh python <script>` for our scripts (it keeps ROS's Python 3.10 packages out of our newer Python).
+ROS stays on this machine (`ROS_LOCALHOST_ONLY=1`) and rosbridge listens on 127.0.0.1 only, so nobody else on the lab
+network can reach or drive the arm, and our commands can't reach another group's. The panel is on 127.0.0.1 too.
 
-On the lab PC (with ROS 2 Humble + the ROBOTIS packages + this repo's `ros_ws` built):
-
-```bash
-ros2 launch open_manipulator_x_bringup hardware.launch.py      # port_name:=/dev/ttyUSB0 is the default
-ros2 launch rosbridge_server rosbridge_websocket_launch.xml address:=<lab-pc-ip>   # the cable to the laptop only
-ros2 run arm_node arm_node
-```
-
-On the laptop: `venv/bin/python runner.py --participant P07 --block 1 --vision cameras --host <lab-pc-ip>`.
+`./lab.sh python lab_check.py` reports what's ready and what isn't. `--hover` tests camera-to-arm: the fingertips
+stop above each piece the cameras see. `runner.py ... --air` is a full dry run: slow, fingertips about 45 mm over the
+table, no piece moves, logged to its own `*_air.jsonl`.
 
 If the link to rosbridge drops, STOP can't reach the arm: the panel says so in red, and the stop is logged with
-`sent: false`. Keep the torque-off / power switch in reach. rosbridge has no authentication: anyone who reaches
-port 9090 can move the arm. Connect the laptop and the
-lab PC directly (cable), bind rosbridge to that address as above (without `address:=` it listens on every
-interface), and firewall 9090 to the laptop's address if the lab PC shares that network with anything else. The operator panel listens on 127.0.0.1
-only; `--panel-host 0.0.0.0` exposes it to the network.
+`sent: false`. Keep the torque-off / power switch in reach.
 
 ### Calibrate before any participant, in this order
 
@@ -167,23 +161,23 @@ only; `--panel-host 0.0.0.0` exposes it to the network.
    OpenMANIPULATOR-X. A differently sized (e.g. 3D-printed) arm needs its own lengths there, measured
    joint axis to joint axis, and `TOOL` measured from joint 4 to the fingertips. Rerun the kinematics
    self-test afterwards.
-2. **Cameras.** `venv/bin/python calib_gui.py`: turn off test mode, capture 15-25 checkerboard pairs
+2. **Cameras.** `./lab.sh python calib_gui.py`: turn off test mode, capture 15-25 checkerboard pairs
    (9 × 6 inner corners, 25 mm squares) at different angles. Accept if the RMS error is < 0.5 px.
 3. **Table pose.** In the same GUI: lay the checkerboard flat on the table and capture the table pose. This
    defines the table frame every position is measured in. Once that's done, don't move the cameras or the table.
 4. **Colours.** Check the detection tab under the lab lights. Tune the HSV ranges in `pieces.py` if a colour
    is missed. White pieces need a dark mat under them.
-5. **Table → robot.** `venv/bin/python robot_frame.py --host <lab-pc-ip>`: close the gripper and touch the
+5. **Table → robot.** `./lab.sh python robot_frame.py`: close the gripper and touch the
    fingertips to 4-6 known table points spread over the work area (torque off, move by hand). Then
    `--check` on new points: accept if every error is < 5 mm. Redo after re-capturing the table pose. Each
    pick / place then carries the table's height at that spot, so a slightly tilted table is fine. The arm
    goes down and up in 5 mm IK steps (truly vertical), so 40 mm between pieces leaves room for the fingers;
    measure the open fingers on the real gripper and raise `SPACING_MM` in `runner.py` if they need more.
-6. **Layout.** Write `layouts/lab.yaml` from the printed template (slot and zone positions in table mm) and
-   point the scenarios at it. The runner refuses a layout with a spot the arm can't reach.
+6. **Layout.** `./lab.sh python lab_layout.py` writes `layouts/lab.yaml`; `--view` draws it on the cameras so
+   you can place the pieces. The runner refuses a layout with a spot the arm can't reach.
 7. **Microphone and voice.** Place the microphone near the participant, away from the arm's motors and the
-   speaker. `venv/bin/python speech.py --test --lang <participant's language>`: the level should move when
-   someone talks, and yes / no / the colours should come out right. Record the six WAVs (see section 2).
+   speaker. `./lab.sh python speech.py --test --lang <participant's language>`: the level should move when
+   someone talks, and yes / no / the colours should come out right. Listen to the six WAVs (see section 2).
 8. **Dry runs.** 50 pick-and-place moves with no unplanned errors (tune `EMPTY_MARGIN` in `arm_node.py`
    if a good grasp is reported as "closed on nothing"), then a pilot of every condition.
    Check the log and timing.

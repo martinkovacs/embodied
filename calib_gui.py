@@ -5,7 +5,8 @@ Steps (tabs): 1 Setup -> 2 Stereo calibration (capture checkerboard pairs, calib
 
 Sources are two cameras, or in test mode image files that stand in for them: one left/right set per step
 (calibration pairs, table pose, detection scene), defaulting to the Blender renders in synthetic/.
-Captured pairs, settings and calib.json live in calib_data/, so a session can be resumed.
+Captured pairs, settings and calib.json live in calib_data/, so a session can be resumed. In test mode the pairs and
+calib.json live in synthetic/gui/ instead, so test images can never end up in the lab's calibration.
 
 Run:  venv/bin/python calib_gui.py             (opens its own app window, dark mode)
       venv/bin/python calib_gui.py --browser   (only serve on http://localhost:8080)
@@ -27,9 +28,8 @@ from nicegui import app, run, ui
 
 import pieces
 import stereo_calib as sc
-from cameras import CALIB_PATH, DATA, SETTINGS_PATH, STAGES, TEST_FILES, Source, load_settings
+from cameras import DATA, SETTINGS_PATH, STAGES, TEST_DATA, TEST_FILES, Source, list_cameras, load_settings
 
-PAIRS = DATA / "pairs"
 PREVIEW_W = 640
 PORT = 8080
 BROWSERS = ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "brave", "microsoft-edge-stable")
@@ -48,17 +48,35 @@ class Pair:
 
 class State:
     def __init__(self):
-        DATA.mkdir(exist_ok=True)
-        PAIRS.mkdir(exist_ok=True)
         self.settings = load_settings()
         self.sources = {}  # stage -> (left, right); with cameras every stage shares the same pair
         self.lock = threading.Lock()
         self.pairs: list[Pair] = []
         self.image_size = None
-        self.calib = sc.StereoCalib.load(CALIB_PATH) if CALIB_PATH.exists() else None
+        self.calib = None
+        self.loaded = None  # the data folder pairs and calib came from
         self.rect_maps = None
         self.views = None  # (TopView left, TopView right) for detection
         self.last_auto = 0.0
+
+    @property
+    def data(self):
+        return TEST_DATA if self.settings["test_mode"] else DATA
+
+    @property
+    def pairs_dir(self):
+        return self.data / "pairs"
+
+    def load_data(self):
+        """Pairs and calibration of the current mode's folder (again when test mode was switched)."""
+        self.pairs_dir.mkdir(parents=True, exist_ok=True)
+        self.pairs.clear()
+        self.loaded = self.data
+        self.rect_maps = self.views = None
+        self.calib = sc.StereoCalib.load(self.data / "calib.json") if (self.data / "calib.json").exists() else None
+        load_saved_pairs()
+        if self.calib is not None and self.calib.T_left_table is not None:
+            self.save_calib()  # builds the detection views
 
     @property
     def pattern(self):
@@ -80,6 +98,8 @@ class State:
             for src in {s for pair in self.sources.values() for s in pair}:
                 src.release()
             self.sources = {}
+            if self.loaded != self.data:
+                self.load_data()
             w, h = int(self.settings["width"]), int(self.settings["height"])
             errors = []
             if self.settings["test_mode"]:
@@ -110,7 +130,7 @@ class State:
                     src.idx = (src.idx + d) % len(src.files)
 
     def save_calib(self):
-        self.calib.save(CALIB_PATH)
+        self.calib.save(self.data / "calib.json")
         self.rect_maps = None
         self.views = None
         if self.calib.T_left_table is not None:
@@ -171,8 +191,8 @@ def capture_pair(left, right):
     if cl is None or cr is None:
         return None
     name = f"{int(time.time() * 1000) % 10**9:09d}"
-    cv2.imwrite(str(PAIRS / f"{name}_left.png"), left)
-    cv2.imwrite(str(PAIRS / f"{name}_right.png"), right)
+    cv2.imwrite(str(S.pairs_dir / f"{name}_left.png"), left)
+    cv2.imwrite(str(S.pairs_dir / f"{name}_right.png"), right)
     S.image_size = (left.shape[1], left.shape[0])
     return Pair(name, cl, cr)
 
@@ -192,9 +212,9 @@ def import_all():
 
 
 def load_saved_pairs():
-    for f in sorted(PAIRS.glob("*_left.png")):
+    for f in sorted(S.pairs_dir.glob("*_left.png")):
         name = f.name.removesuffix("_left.png")
-        left, right = cv2.imread(str(f)), cv2.imread(str(PAIRS / f"{name}_right.png"))
+        left, right = cv2.imread(str(f)), cv2.imread(str(S.pairs_dir / f"{name}_right.png"))
         if right is None:
             continue
         cl, cr = sc.find_corners(left, S.pattern), sc.find_corners(right, S.pattern)
@@ -223,8 +243,8 @@ def capture_table(left, right):
     T, rms = sc.table_pose_from_pair(cl, cr, S.calib, S.pattern, S.square)
     S.calib.T_left_table = T
     S.save_calib()
-    cv2.imwrite(str(DATA / "table_left.png"), left)
-    cv2.imwrite(str(DATA / "table_right.png"), right)
+    cv2.imwrite(str(S.data / "table_left.png"), left)
+    cv2.imwrite(str(S.data / "table_right.png"), right)
     return rms
 
 
@@ -235,6 +255,11 @@ def detect_both(left, right):
 
 
 # ---------- UI ----------
+
+def cameras_found():
+    cams = list_cameras()
+    return "Cameras found: " + ", ".join(f"{i} = {name}" for i, name in cams) if cams else "No cameras found."
+
 
 def camera_pose_text():
     """Height above the table and tilt from vertical for both cameras."""
@@ -290,6 +315,9 @@ def root():
         if S.calib is not None:
             status["chip_cal"].text = f"RMS {S.calib.rms:.2f}px · baseline {S.calib.baseline_mm:.1f} mm"
             status["chip_cal"].props("color=positive text-color=white")
+        else:
+            status["chip_cal"].text = "not calibrated"
+            status["chip_cal"].props("color=grey text-color=white")
         has_table = S.calib is not None and S.calib.T_left_table is not None
         status["chip_table"].text = "table pose ✓" if has_table else "no table pose"
         status["chip_table"].props(f"color={'positive' if has_table else 'grey'} text-color=white")
@@ -321,7 +349,7 @@ def root():
                         ui.space()
                         ui.switch("Test mode: image files instead of cameras").bind_value(S.settings, "test_mode")
                     with ui.column().classes("w-full gap-1").bind_visibility_from(S.settings, "test_mode", value=False):
-                        ui.label("Camera indices as used by OpenCV (0, 1, ...).").classes("text-sm opacity-70")
+                        found = ui.label(cameras_found()).classes("text-sm opacity-70")
                         with ui.row().classes("w-full"):
                             ui.input("Left camera").bind_value(S.settings, "left").classes("flex-1")
                             ui.input("Right camera").bind_value(S.settings, "right").classes("flex-1")
@@ -351,11 +379,16 @@ def root():
                         except Exception as e:
                             ui.notify(str(e), type="negative")
                             return
+                        found.text = cameras_found()
                         for e in errors:
                             ui.notify(e, type="warning")
                         if S.sources:
                             ui.notify("Test images loaded" if S.settings["test_mode"] else "Cameras connected", type="positive")
+                        refresh_pairs()
                         refresh_status()
+                        draw_scene()
+                        if S.calib is not None:
+                            refresh_result()
                     ui.space()
                     ui.button("Connect", icon="link", on_click=do_connect)
 
@@ -451,7 +484,7 @@ def root():
             def delete_pair(p):
                 S.pairs.remove(p)
                 for side in ("left", "right"):
-                    (PAIRS / f"{p.name}_{side}.png").unlink(missing_ok=True)
+                    (S.pairs_dir / f"{p.name}_{side}.png").unlink(missing_ok=True)
                 refresh_pairs()
 
             def clear_pairs():
@@ -720,10 +753,7 @@ def root():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    if not S.pairs:
-        load_saved_pairs()
-    if S.calib is not None and S.calib.T_left_table is not None:
-        S.save_calib()  # builds the detection views
+    S.load_data()
     try:
         S.connect()  # reconnect the sources from the last session
     except Exception as e:

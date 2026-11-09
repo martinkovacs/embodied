@@ -4,8 +4,10 @@ Source is a camera (spec is an index) or a sorted list of image files (spec is a
 files can stand in for the cameras in test mode. Paths are anchored at this folder, so callers don't
 depend on the working directory.
 """
+import fcntl
 import glob
 import json
+import struct
 from pathlib import Path
 
 import cv2
@@ -14,6 +16,9 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "calib_data"
 CALIB_PATH = DATA / "calib.json"
 SETTINGS_PATH = DATA / "settings.json"
+SYNTHETIC_CALIB = ROOT / "synthetic" / "calib.json"     # goes with the synthetic renders, whatever the lab calibrated
+SYNTHETIC_BOARD_MM = 0.8                                 # the rendered board's thickness
+TEST_DATA = ROOT / "synthetic" / "gui"                   # calib_gui.py in test mode: never mixes with the lab's DATA
 
 STAGES = {"calib": "Calibration pairs", "table": "Table pose", "scene": "Detection scene"}
 # Test mode: image files stand in for the cameras, one left/right set per step (paths relative to ROOT).
@@ -26,6 +31,22 @@ DEFAULTS = {"left": "0", "right": "1", "width": 1280, "height": 960,
 
 # grab() past the frames a webcam queued while nobody read; a single grab() after a pause returns a stale frame
 FLUSH_FRAMES = 5
+
+
+def list_cameras():
+    """[(index, name)] of the V4L2 nodes that capture video. A UVC camera also has a metadata node that OpenCV can't
+    read, so its index in /dev/video* isn't simply the next free number. Empty where there is no V4L2."""
+    VIDIOC_QUERYCAP, CAP_VIDEO_CAPTURE = 0x80685600, 0x1
+    out = []
+    for dev in sorted(glob.glob("/dev/video*"), key=lambda d: int(d.removeprefix("/dev/video"))):
+        try:
+            with open(dev, "rb") as f:
+                buf = fcntl.ioctl(f, VIDIOC_QUERYCAP, bytes(104))
+        except OSError:
+            continue
+        if struct.unpack_from("<I", buf, 88)[0] & CAP_VIDEO_CAPTURE:    # device_caps: this node, not the whole device
+            out.append((int(dev.removeprefix("/dev/video")), buf[16:48].split(b"\0")[0].decode(errors="replace")))
+    return out
 
 
 def fresh_pair(left, right):
@@ -51,7 +72,8 @@ class Source:
             self.cap = cv2.VideoCapture(int(self.spec))
             if not self.cap.isOpened():
                 raise RuntimeError(f"cannot open camera {self.spec}")
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # before the size; two raw streams
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)                       # this large don't fit on one USB bus
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # best effort; some backends ignore it
         else:

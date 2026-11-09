@@ -2,7 +2,9 @@
 
 /arm/cmd     std_msgs/String JSON  {"id": 7, "op": "pick", "x": 120, "y": -40}   x, y: robot base frame (link1), mm
               z: table surface height at (x, y), mm, required for pick/place (GRASP_Z etc. are heights above it)
-             op: pick | place (x, y, z) | show | home | open | stop
+             op: pick | place | hover (x, y, z) | show | home | open | stop
+             air: true (optional) makes a dry run of the command: slow, pick / place stop AIR_MM above the piece
+             hover: the fingertips go to the approach height over (x, y), always slowly, and stay there
 /arm/status  std_msgs/String JSON  {"id": 7, "state": "started" | "done" | "failed", "reason": "..."}
 
 One command at a time: another one arriving meanwhile fails with "busy". stop cancels the running motion and
@@ -40,6 +42,8 @@ JOINTS = ["joint1", "joint2", "joint3", "joint4"]
 OPEN, CLOSED = 0.019, -0.01     # gripper_left_joint limits, m; closing on a piece just stalls on it
 EMPTY_MARGIN = 0.002            # m: tune in the lab: a grasp stalls above CLOSED, a miss closes right to it
 MAX_SPEED = 0.6                 # rad/s, for the joint that moves most
+AIR_SPEED = 0.25                # rad/s, the same for dry runs and hovers
+AIR_MM = 40.0                   # a dry run's pick / place stops this much higher: fingertips ~45 mm over the table
 MIN_MOVE_S = 1.0
 GOAL_ACCEPT_S = 5.0             # a live controller answers this fast
 CANCEL_ACK_S = 2.0              # stop: how long the controller may take to answer its cancel request
@@ -48,14 +52,14 @@ GRIP_RESULT_S = 5.0             # gripper goal result
 JOINT_STALE_S = 1.0             # /joint_states: without a reading fresher than this, nothing may move
 
 
-def trajectory(q_from, points):
+def trajectory(q_from, points, speed=MAX_SPEED):
     """[JointTrajectoryPoint] for one trajectory from q_from through points, and its total duration s: per
-    segment max(largest joint delta / MAX_SPEED, 0.05 s), cumulative, scaled up to MIN_MOVE_S. Zero velocity
+    segment max(largest joint delta / speed, 0.05 s), cumulative, scaled up to MIN_MOVE_S. Zero velocity
     at the ends, central differences in between, so the controller fits smooth splines through all of it."""
     qs = [list(q_from)] + [list(p) for p in points]
     ts = [0.0]
     for a, b in zip(qs, qs[1:]):
-        ts.append(ts[-1] + max(max(abs(m - n) for m, n in zip(a, b)) / MAX_SPEED, 0.05))
+        ts.append(ts[-1] + max(max(abs(m - n) for m, n in zip(a, b)) / speed, 0.05))
     if ts[-1] < MIN_MOVE_S:                 # scale up, keeping the pacing
         ts = [t * MIN_MOVE_S / ts[-1] for t in ts]
     out = []
@@ -84,6 +88,7 @@ class ArmNode(Node):
         self.sending = None             # the goal request in flight, while its acceptance is awaited
         self.adrift = None              # a timed-out goal (handle) or request (future) that may yet move the arm
         self.busy = self.stopped = False
+        self.speed = MAX_SPEED          # of the running command
         self.create_subscription(JointState, "/joint_states", self.on_joints, 10)
         # reentrant: a stop has to get through while a command is still awaiting the controllers
         self.create_subscription(String, "/arm/cmd", self.on_cmd, 10, callback_group=ReentrantCallbackGroup())
@@ -204,20 +209,28 @@ class ArmNode(Node):
         self.get_logger().info(json.dumps(out))
 
     async def run(self, cmd):
-        op = cmd["op"]
+        op, air = cmd["op"], bool(cmd.get("air"))
+        self.speed = AIR_SPEED if air or op == "hover" else MAX_SPEED
         if op == "home":
             await self.travel(HOME, self.table_z)
         elif op == "show":
             await self.travel(SHOW, self.table_z)
         elif op == "open":
             await self.grip(OPEN)
+        elif op == "hover":
+            if cmd.get("z") is None:
+                raise ValueError("hover needs z (table surface height at (x, y) in the robot frame, mm)")
+            table_z = float(cmd["z"])
+            q = vertical(float(cmd["x"]), float(cmd["y"]), table_z + GRASP_Z + LIFT, table_z + GRASP_Z + LIFT)[0]
+            visit_z, self.table_z = max(self.table_z, table_z), table_z
+            await self.travel(q, visit_z)
         elif op in ("pick", "place"):
             if cmd.get("z") is None:        # the table height varies over the layout: assuming 0 would dig in
                 raise ValueError(f"{op} needs z (table surface height at (x, y) in the robot frame, mm)")
             x, y = float(cmd["x"]), float(cmd["y"])
             table_z = float(cmd["z"])
             # descent and ascent solved before anything moves, so an unreachable spot fails cleanly
-            up_z, down_z = table_z + GRASP_Z + LIFT, table_z + (GRASP_Z if op == "pick" else PLACE_Z)
+            up_z, down_z = table_z + GRASP_Z + LIFT, table_z + (GRASP_Z if op == "pick" else PLACE_Z) + (AIR_MM if air else 0)
             descent, ascent = vertical(x, y, up_z, down_z), vertical(x, y, down_z, up_z)
             visit_z = max(self.table_z, table_z)    # the approach must clear both tables (the runner checks the max)
             self.op_xy, self.table_z = (x, y), table_z  # remembered for the recovery lift of an interrupted op
@@ -228,7 +241,7 @@ class ArmNode(Node):
             if op == "pick":
                 res = await self.grip(CLOSED)
                 pos = getattr(res.result, "position", None)     # absent (fake hardware): skip the check
-                if pos is not None and pos <= CLOSED + EMPTY_MARGIN:    # jaws at the limit: nothing between them
+                if not air and pos is not None and pos <= CLOSED + EMPTY_MARGIN:   # jaws at the limit: nothing there
                     await self.move(ascent)                     # clear the piece level before failing
                     raise RuntimeError("gripper closed on nothing: missed the piece")
             else:
@@ -257,7 +270,7 @@ class ArmNode(Node):
 
     async def move(self, points):
         """One multi-point trajectory from where the arm is (per /joint_states) through points."""
-        pts, total = trajectory(self.joints(), points)
+        pts, total = trajectory(self.joints(), points, self.speed)
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = JOINTS
         goal.trajectory.points = pts

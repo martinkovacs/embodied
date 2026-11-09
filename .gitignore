@@ -11,3 +11,8 @@ logs/
 
 # speech models (downloaded, ~1 GB)
 models/
+
+# calibration images: big, and specific to one lab session
+calib_data/pairs/
+# what calib_gui.py saves in test mode
+synthetic/gui/

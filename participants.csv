@@ -1,2 +1,3 @@
 participant,conditions
 P00,correct mistake ask_low ask_high
+TEST,smoke

@@ -4,8 +4,9 @@ zones, one piece = one trial, behaving as the condition's script says (correct /
 Per trial attempt: [home] -> detect -> pick -> [ask: show, "Is this <colour>?", wait yes/no] -> place -> home -> verify.
 
 Files:
-  scenarios/<condition>.yaml   slot order + per-trial script; names its layout
-  layouts/*.yaml               the printed template: piece slots and zone spots (table mm), robot frame file
+  scenarios/<condition>.yaml   slot order + per-trial script
+  layouts/synthetic.yaml       --vision synthetic: piece slots and zone spots (table mm), robot frame file
+  layouts/lab.yaml             --vision cameras: the same for the real table (lab_layout.py writes it)
   participants.csv             participant -> conditions in the order they run (counterbalancing)
   audio/ask_<colour>.wav, which.wav, done.wav   the robot's recorded lines (SAY); without them macOS `say` stands in
   logs/<participant>_<condition>.jsonl         every event; a block that never finished is resumed on the next start
@@ -23,6 +24,7 @@ Usage (from the repo root):
                               [--panel-host 127.0.0.1]   # operator panel on http://127.0.0.1:8081
                               [--lang en|hu] [--mic N] [--no-speech]   # spoken answers (speech.py), or buttons only
                               [--no-voice]               # the robot stays silent (logged)
+                              [--air]                    # dry run: slow, fingertips stay high, no piece moves
     venv/bin/python runner.py --self-test                # every condition: fake arm, synthetic vision, no ROS
 """
 import argparse
@@ -59,6 +61,7 @@ REACH_Z = (GRASP_Z, PLACE_Z, GRASP_Z + LIFT)   # arm_node's heights: every slot 
 ARM_TIMEOUT_S = 60.0
 STOP_CONFIRM_S = 8.0            # the node's worst case to confirm a stop: GOAL_ACCEPT_S + CANCEL_ACK_S
 PORT = 8081
+SYNTHETIC_LAYOUT, LAB_LAYOUT = "layouts/synthetic.yaml", "layouts/lab.yaml"
 SAY = {"ask": "Is this {color}?", "which": "Which colour is it?", "done": "Done."}
 PLAYERS = ("pw-play", "paplay", "aplay", "afplay")   # first one installed plays the WAVs
 
@@ -79,12 +82,23 @@ class Aborted(Exception):
     pass
 
 
-def load_scenario(condition):
-    """scenarios/<condition>.yaml with its layout and robot frame, checked (check_scenario)."""
+def zone_need(order, script, colors):
+    """Spots each zone can need in the worst case: an asked participant may say "no" and name any colour.
+    colors: slot -> colour."""
+    need = dict.fromkeys(COLORS, 0)
+    for i, slot in enumerate(order, 1):
+        b = script.get(i, {"behavior": "correct"})
+        for c in {"correct": [colors[slot]], "mistake": [b.get("put_to")], "ask": COLORS}[b["behavior"]]:
+            need[c] += 1
+    return need
+
+
+def load_scenario(condition, layout=SYNTHETIC_LAYOUT):
+    """scenarios/<condition>.yaml with a layout and its robot frame, checked (check_scenario)."""
     sc = yaml.safe_load((ROOT / "scenarios" / f"{condition}.yaml").read_text())
     assert sc["condition"] == condition, f"{condition}.yaml says condition {sc['condition']}"
-    lay = yaml.safe_load((ROOT / sc["layout"]).read_text())
-    return check_scenario(sc, lay, robot_frame.load(ROOT / lay["robot_frame"])) | {"layout": sc["layout"]}
+    lay = yaml.safe_load((ROOT / layout).read_text())
+    return check_scenario(sc, lay, robot_frame.load(ROOT / lay["robot_frame"])) | {"layout": layout}
 
 
 def check_scenario(sc, lay, T):
@@ -147,12 +161,7 @@ def check_scenario(sc, lay, T):
             d = np.hypot(ax - bx, ay - by)
             assert d >= slot_min, f"layout {a} is {d:.0f} mm from {b}, under {slot_min:.0f} mm"
 
-    # worst case: an asked participant may say "no" and name any colour
-    need = dict.fromkeys(COLORS, 0)
-    for i, slot in enumerate(order, 1):
-        b = script.get(i, {"behavior": "correct"})
-        for c in {"correct": [slots[slot][0]], "mistake": [b.get("put_to")], "ask": COLORS}[b["behavior"]]:
-            need[c] += 1
+    need = zone_need(order, script, {k: v[0] for k, v in slots.items()})
     for c in COLORS:
         assert len(zones[c]) >= need[c], f"layout {c} zone: {len(zones[c])} spots, the script can need {need[c]}"
     return dict(order=order, script=script, slots=slots, zones=zones, T=T)
@@ -169,13 +178,14 @@ class Vision:
     pair. Blocking (~1 s): the runner calls detect() in a worker thread."""
 
     def __init__(self, synthetic=False):
-        if not cameras.CALIB_PATH.exists():
-            raise RuntimeError(f"no {cameras.CALIB_PATH}: run calib_gui.py (stereo calibration + table pose)")
-        self.calib = StereoCalib.load(cameras.CALIB_PATH)
+        path = cameras.SYNTHETIC_CALIB if synthetic else cameras.CALIB_PATH
+        if not path.exists():
+            raise RuntimeError(f"no {path}: run calib_gui.py (stereo calibration + table pose)")
+        self.calib = StereoCalib.load(path)
         if self.calib.T_left_table is None:
-            raise RuntimeError(f"{cameras.CALIB_PATH} has no table pose: run calib_gui.py and capture the table pose")
+            raise RuntimeError(f"{path} has no table pose: run calib_gui.py and capture the table pose")
         st = cameras.load_settings()
-        b = float(st["board_mm"])
+        b = cameras.SYNTHETIC_BOARD_MM if synthetic else float(st["board_mm"])
         self.views = pieces.view_from_calib(self.calib, "left", b), pieces.view_from_calib(self.calib, "right", b)
         w, h = int(st["width"]), int(st["height"])
         keys = ("test_scene_left", "test_scene_right") if synthetic else ("left", "right")
@@ -187,6 +197,9 @@ class Vision:
             left, right = cameras.fresh_pair(*self.sources)
             if left is None or right is None:
                 raise Unplanned("camera gave no image")
+            if (left.shape[1], left.shape[0]) != tuple(self.calib.left.image_size):
+                raise Unplanned(f"camera gives {left.shape[1]}x{left.shape[0]}, calibrated at "
+                                f"{self.calib.left.image_size[0]}x{self.calib.left.image_size[1]}")
             found = pieces.matched_pieces(self.calib, pieces.detect_pieces(left, self.views[0]),
                                           pieces.detect_pieces(right, self.views[1]))
         # only pieces both cameras agree on: one camera alone is where false detections come from
@@ -223,8 +236,9 @@ class SimWorld(Vision):
 class RosArm:
     """arm_node's /arm/cmd + /arm/status over rosbridge. x, y, z robot frame mm (z: the table surface there)."""
 
-    def __init__(self, host):
+    def __init__(self, host, air=False):
         import roslibpy
+        self.air = air
         self.roslibpy = roslibpy
         self.ros = roslibpy.Ros(host=host, port=9090)
         self.ros.run(timeout=10)  # raises if rosbridge isn't up
@@ -250,7 +264,7 @@ class RosArm:
         self.n += 1
         cid = f"{self.nonce}-{self.n}"
         cmd = ({"id": cid, "op": op} | ({} if x is None else {"x": round(x, 1), "y": round(y, 1)})
-               | ({} if z is None else {"z": round(z, 1)}))
+               | ({} if z is None else {"z": round(z, 1)}) | ({"air": True} if self.air else {}))
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self.waiting[cid] = (loop, fut)
@@ -388,11 +402,13 @@ class Log:
 
 
 class Runner:
-    def __init__(self, participant, condition, arm, vision, log_dir=ROOT / "logs", auto=None, audio=True, info=None):
-        self.sc = load_scenario(condition)
-        self.arm, self.vision, self.auto, self.audio = arm, vision, auto, audio
+    def __init__(self, participant, condition, arm, vision, log_dir=ROOT / "logs", auto=None, audio=True, info=None,
+                 layout=SYNTHETIC_LAYOUT, air=False):
+        self.sc = load_scenario(condition, layout)
+        self.arm, self.vision, self.auto, self.audio, self.air = arm, vision, auto, audio, air
         self.info = info or {}                 # how this run is set up, for session_start: vision, arm, language, ...
-        self.log = Log(Path(log_dir) / f"{participant}_{condition}.jsonl", participant, condition)
+        # a dry run has its own log: it is no data, and if cut off it must not offer a real run to resume it
+        self.log = Log(Path(log_dir) / f"{participant}_{condition}{'_air' if air else ''}.jsonl", participant, condition)
         asked = sorted({self.sc["slots"][self.sc["order"][i - 1]][0]
                         for i, b in self.sc["script"].items() if b["behavior"] == "ask"})
         self.voice = Voice([("ask", c) for c in asked] + ([("which", None)] if asked else []) + [("done", None)])
@@ -643,6 +659,10 @@ class Runner:
             await self.move("place", *self.sc["zones"][target][self.spot])
             self.placed = target
             await self.move("home")
+        if self.air:            # nothing was gripped: the piece is still in its slot, there's nothing to verify
+            self.log("trial_end", placed=self.target, correct=self.target == color, air=True)
+            self.in_trial = False
+            return
         tx, ty = self.sc["zones"][self.target][self.spot]
         p = nearest(await self.detect("after"), tx, ty)
         if p is None or p[0] != color:
@@ -1026,6 +1046,21 @@ def self_test():
         # audio off: nothing spoken, and the panel says so
         assert r.voice_problem == "audio off" and not any(e["spoken"] or e["via"] for e in last(ev, "robot_say"))
 
+        # a dry run: every move happens, nothing is verified, and it gets its own log
+        r = Runner(f"T{len(os.listdir(tmp))}", "smoke", FakeArm(), world, tmp, auto=lambda kind, opts: "yes", audio=False,
+                   air=True)
+        world.reset()
+        world.detect = lambda: (list(world.initial), None)   # the pieces never leave their slots
+        try:
+            asyncio.run(r.run())
+        finally:
+            del world.detect
+        ev = events(r)
+        assert r.log.path.name.endswith("_smoke_air.jsonl") and not last(ev, "unplanned") and not [
+            e for e in last(ev, "vision") if e is None]
+        assert [e["placed"] for e in last(ev, "trial_end")] == ["red", "white", "green", "blue"]
+        assert all(e["air"] and e["correct"] for e in last(ev, "trial_end"))
+
         # "no" to a question: the robot asks which colour and puts it there
         answers = iter(["no", "green"])
         _, ev = run("ask_low", lambda kind, opts: next(answers, "yes"))
@@ -1098,7 +1133,7 @@ def self_test():
 
         # the scenario check names what's wrong: unreachable spot, too small a zone, crowded spots, low travel
         sc = yaml.safe_load((ROOT / "scenarios" / "ask_high.yaml").read_text())
-        lay = yaml.safe_load((ROOT / sc["layout"]).read_text())
+        lay = yaml.safe_load((ROOT / SYNTHETIC_LAYOUT).read_text())
         T0 = robot_frame.load(ROOT / lay["robot_frame"])
         check_scenario(sc, lay, T0)
 
@@ -1393,7 +1428,7 @@ def self_test():
         async def latest_stop_counts():
             arm = RosArm.__new__(RosArm)
             arm.ros = arm.cmd = arm.roslibpy = RosStub
-            arm.waiting, arm.n, arm.last_stop, arm.nonce = {}, 0, None, "test"
+            arm.waiting, arm.n, arm.last_stop, arm.nonce, arm.air = {}, 0, None, "test", False
             assert arm.stop() and arm.stop()
             first, second = (json.loads(m["data"])["id"] for m in published)
             arm.on_status({"data": json.dumps({"id": first, "state": "done"})})
@@ -1530,6 +1565,8 @@ def main():
     ap.add_argument("--mic", type=int, help="input device for spoken answers (speech.py --list-devices)")
     ap.add_argument("--no-voice", action="store_true", help="the robot stays silent (development, or the experimenter "
                                                              "reads the questions); logged")
+    ap.add_argument("--air", action="store_true", help="dry run: slow, fingertips stay about 45 mm above the table, "
+                                                       "pieces stay where they are; logged separately")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -1544,23 +1581,25 @@ def main():
     if not 1 <= args.block <= len(conditions):
         sys.exit(f"{args.participant} has blocks 1..{len(conditions)}")
     condition = conditions[args.block - 1]
-    sc = load_scenario(condition)
-    if args.vision == "cameras" and "synthetic" in sc["layout"]:  # slots that aren't on the real table
-        sys.exit(f"scenarios/{condition}.yaml uses {sc['layout']}: write the lab layout and point the scenarios at it")
+    layout = LAB_LAYOUT if args.vision == "cameras" else SYNTHETIC_LAYOUT   # real pieces are never on synthetic slots
+    if not (ROOT / layout).exists():
+        sys.exit(f"no {layout}: run lab_layout.py")
     try:
         vision = SimWorld() if args.vision == "synthetic" else Vision()
     except RuntimeError as e:  # no calibration, or a camera that doesn't open
         sys.exit(str(e))
-    arm = RosArm(args.host) if args.arm == "ros" else FakeArm()
+    arm = RosArm(args.host, air=args.air) if args.arm == "ros" else FakeArm()
     info = dict(vision=args.vision, arm=args.arm, host=args.host, language=args.lang, speech=not args.no_speech,
-                voice=not args.no_voice)
-    runner = Runner(args.participant, condition, arm, vision, audio=not args.no_voice, info=info)
+                voice=not args.no_voice, air=args.air)
+    runner = Runner(args.participant, condition, arm, vision, audio=not args.no_voice, info=info, layout=layout,
+                    air=args.air)
     speech = None if args.no_speech else Speech(runner, args.lang, device=args.mic)
     if args.panel_host not in ("127.0.0.1", "localhost", "::1"):   # loopback: present but unreachable remotely
         print(f"WARNING: --panel-host {args.panel_host} serves the operator panel to anyone who can reach this "
               "machine: the panel has no authentication and can control the experiment and the robot.",
               file=sys.stderr)
-    panel(runner, f"{args.participant} · block {args.block}/{len(conditions)} · {condition}", args.panel_host, speech)
+    title = f"{args.participant} · block {args.block}/{len(conditions)} · {condition}" + (" · AIR RUN" if args.air else "")
+    panel(runner, title, args.panel_host, speech)
 
 
 if __name__ == "__main__":

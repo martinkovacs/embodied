@@ -1,0 +1,3 @@
+# First real run: one piece of each colour, nothing asked, no mistakes. Not a condition of the experiment.
+condition: smoke
+order: [r1, w1, g1, b1]
