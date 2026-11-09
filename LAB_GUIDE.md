@@ -19,14 +19,17 @@ run `./lab.sh setup` again. It should end with `Setup finished.`
 ## 2. Start the arm
 
 1. Plug in the arm and turn on its power.
-2. Move the arm by hand so the fingers are well above the table (a hand's width is plenty).
+2. Clear the table around the arm: no pieces, cables or hands within its reach.
 3. In the terminal:
 
 ```bash
 ./lab.sh arm
 ```
 
-Wait for `ARM SIDE READY`. **Leave this terminal running.** Everything below goes in a **second terminal**
+Wait for `ARM SIDE READY`. The arm then **rises slowly to its home pose by itself**, from wherever it was lying:
+that is the sign that it works. If it stays down, the line above the warning says why.
+
+**Leave this terminal running.** Everything below goes in a **second terminal**
 (`cd embodied` first). To stop the arm side, press Ctrl-C here.
 
 ## 3. Check that it moves
@@ -37,6 +40,15 @@ Wait for `ARM SIDE READY`. **Leave this terminal running.** Everything below goe
 
 Many lines say FAIL at this point, because nothing is calibrated yet. These four must be OK or WARN:
 *Arm USB adapter, ROS connection, Arm controllers, arm_node*.
+
+To move the arm without the cameras or the experiment, send it one command and read the answer:
+
+```bash
+./lab.sh cmd '{"op": "open"}'
+./lab.sh cmd '{"op": "home"}'
+```
+
+`"state": "done"` means it did it; `"failed"` comes with the reason.
 
 Plug in both cameras too, if they aren't already.
 
@@ -132,7 +144,8 @@ Four pieces sorted into their zones means **the robot works**.
 |---|---|
 | `/dev/ttyUSB0 doesn't exist` | Check the arm's USB cable and power |
 | `no permission on /dev/ttyUSB0` | `sudo chmod 666 /dev/ttyUSB0` |
-| `home` refuses, "cannot be lifted by a command" | Stop `./lab.sh arm`, lift the arm by hand, start it again |
+| `home` refuses, "cannot be lifted by a command" | Take the pieces away, then `./lab.sh cmd '{"op": "wake"}'` |
+| The arm doesn't rise after `ARM SIDE READY` | Read the reason printed there. "controller not running": power and USB of the arm, then restart `./lab.sh arm` |
 | A camera won't open | Close `calib_gui.py`. Only one program can use a camera at a time |
 | "Cameras found: none" for the Basler cameras (USB) | `echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="2676", MODE="0666"' \| sudo tee /etc/udev/rules.d/69-basler.rules`, then `sudo udevadm control --reload-rules`, and replug them |
 | Basler cameras not found (network models) | They need an IP on the PC's network: ask the lab staff, or set it in Basler's pylon Viewer |

@@ -108,6 +108,49 @@ def lift_path(q_now, table_z, op_xy=None):
     return pts
 
 
+def heights(q):
+    """z of the elbow (joint3), the wrist (joint4) and the fingertips."""
+    _, q2, q3, q4 = q
+    elbow = J2_Z - UP_X * sin(q2) + UP_Z * cos(q2)
+    wrist = elbow - FOREARM * sin(q2 + q3)
+    return elbow, wrist, wrist - TOOL * sin(q2 + q3 + q4)
+
+
+def wake_path(q_now, q_to=HOME, step=0.1):
+    """Waypoints [q] from wherever the arm lies (resting on the table, folded, moved by hand) up to q_to, along
+    which the elbow, wrist and fingertips never go more than 2 mm lower than the lowest of them is now (or, for
+    an arm already above q_to, than the lowest of them at q_to): whatever the arm rests on, it only moves away
+    from it. Breadth-first over joint2..4 in `step` rad moves until the
+    straight joint-space line to q_to is clear; joint1 only turns on that last line. ValueError if there is none.
+    shortcut: knows nothing about pieces or anything else standing around the arm, so it is for starting up
+    with a clear table, not for use between trials."""
+    floor = min(*heights(q_now), *heights(q_to)) - 2.0
+
+    def clear(a, b, n):
+        return all(min(heights(tuple(m + (w - m) * i / n for m, w in zip(a, b)))) >= floor for i in range(1, n + 1))
+
+    start, q_to = tuple(q_now), tuple(q_to)
+    if not all(lo <= v <= hi for v, (lo, hi) in zip(start, LIMITS)):    # also catches nan
+        raise ValueError(f"joints {[round(v, 2) for v in start]} are outside their limits")
+    came, queue = {(0, 0, 0): None}, [(0, 0, 0)]
+    at = lambda k: (start[0], *(start[j + 1] + k[j] * step for j in range(3)))
+    for k in queue:                             # appended to while iterating: breadth-first
+        if clear(at(k), q_to, 40):
+            pts = [q_to]
+            while came[k] is not None:
+                pts.insert(0, at(k))
+                k = came[k]
+            return pts
+        for j in range(3):
+            for d in (-1, 1):
+                n = tuple(v + d * (i == j) for i, v in enumerate(k))
+                lo, hi = LIMITS[j + 1]
+                if n not in came and lo <= at(n)[j + 1] <= hi and clear(at(k), at(n), 2):
+                    came[n] = k
+                    queue.append(n)
+    raise ValueError(f"no way up from here without going lower first: {LIFT_RECOVERY}")
+
+
 if __name__ == "__main__":
     assert max(abs(a - b) for a, b in zip(fk((0, 0, 0, 0)), (J1_X + UP_X + FOREARM + TOOL, 0, J2_Z + UP_Z))) < 1e-9
     assert CLEAR <= LIFT
@@ -175,4 +218,17 @@ if __name__ == "__main__":
             assert "hand" in str(e) and "torque" in str(e) and "home" in str(e), str(e)
         else:
             raise AssertionError(f"{q} should be unrecoverable by lift_path")
+    for q in ((0.17, 1.47, 1.37, 0.21), (-0.61, 0.53, 1.26, -1.45), (1.0, 1.0, 1.0, 1.0), (0.0, 1.2, 0.9, 0.3)):
+        pts, floor = wake_path(q), min(heights(q)) - 2.0           # the poses no command could lift: wake_path does,
+        assert pts[-1] == home, pts                                # and nothing dips on the way to home
+        for a, b in zip([q, *pts], pts):
+            assert min(min(heights(tuple(m + (w - m) * i / 50 for m, w in zip(a, b)))) for i in range(51)) > floor - 1.0
+    assert wake_path(home) == [home]
+    assert wake_path((0.0, 0.0, 0.0, 0.0)) == [home]            # from above home (fake hardware starts here): down to it
+    try:
+        wake_path((0.0, 3.0, 0.0, 0.0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("joints outside their limits should be refused")
     print("kinematics ok")

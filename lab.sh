@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Everything on the lab PC goes through this script (LAB_GUIDE.md is the walkthrough).
-#   ./lab.sh setup             check ROS, install what's ours to install, build ros_ws, run the self-tests
-#   ./lab.sh arm [--fake]      start the ROS side and leave it running (--fake: simulated joints, no arm)
+#   ./lab.sh setup             once: check ROS, install what's ours to install, build ros_ws, run the self-tests
+#   ./lab.sh run P07 [...]     a whole session: start the arm, wait until it has woken up, run the experiment
+#                              (--fake first: simulated joints and synthetic images; then runner.py's options)
+#   ./lab.sh arm [--fake]      only the ROS side, left running (--fake: simulated joints, no arm)
+#   ./lab.sh cmd '{"op": "home"}'   send the arm one command and print its answer (ops: arm_node.py's docstring)
 #   ./lab.sh torque-off        let the arm be moved by hand (afterwards restart ./lab.sh arm)
 #   ./lab.sh python X.py ...   run one of our Python scripts
 set -euo pipefail
@@ -81,35 +84,74 @@ cmd_setup() {
 cmd_arm() {
     source_ros
     [ -f ros_ws/install/setup.bash ] || die "run ./lab.sh setup first"
-    local launch=(hardware.launch.py)
+    local fake=false
     if [ "${1:-}" = "--fake" ]; then
-        launch=(fake.launch.py start_rviz:=false use_sim:=false)
+        fake=true
     else
         [ -e "$PORT" ] || die "$PORT doesn't exist: is the arm's USB adapter plugged in and powered?"
         [ -r "$PORT" ] && [ -w "$PORT" ] || die "no permission on $PORT. Run: sudo chmod 666 $PORT"
     fi
+    ros2 daemon stop >/dev/null 2>&1 || true    # a daemon left over from a killed session answers nothing, and
+                                                # the readiness check below would never see the controllers
     trap 'trap - EXIT INT TERM; echo "Stopping the ROS side."; kill 0 2>/dev/null || true' EXIT INT TERM
-    ros2 launch open_manipulator_x_bringup "${launch[@]}" &
-    local bringup=$!
-    ros2 launch rosbridge_server rosbridge_websocket_launch.xml address:=127.0.0.1 &
-    local bridge=$!
-    ros2 run arm_node arm_node &
-    local node=$!
+    ros2 launch arm_node lab.launch.py fake:=$fake &
+    local launch=$!
     (
         for _ in $(seq 40); do
             if [ "$(ros2 control list_controllers 2>/dev/null | grep -v inactive | grep -c active)" -ge 3 ]; then
                 echo "=========================================================="
                 echo " ARM SIDE READY. Leave this running, open a second terminal."
+                echo " The arm now rises slowly to its home pose: keep clear."
                 echo "=========================================================="
+                if "$0" cmd '{"op": "wake"}'; then echo "ARM AWAKE"; else echo "ARM NOT READY: it didn't wake up, see the reason above."; fi
                 exit 0
             fi
             sleep 2
         done
-        echo "WARNING: the controllers aren't active after 80 s: check the errors above."
+        echo "ARM NOT READY: the controllers aren't active after 80 s, check the errors above."
     ) &
-    wait -n "$bringup" "$bridge" "$node" || true
-    echo "ERROR: one of the ROS processes stopped: see the messages above." >&2
+    wait "$launch" || true
+    echo "ERROR: the ROS side stopped: see the messages above." >&2
     exit 1
+}
+
+cmd_run() {
+    [ -n "${1:-}" ] || die "usage: ./lab.sh run PARTICIPANT [--fake] [runner.py options]"
+    local participant=$1 arm_args=() vision=cameras log=logs/arm_side.log
+    shift
+    if [ "${1:-}" = "--fake" ]; then arm_args=(--fake); vision=synthetic; shift; fi
+    [ -x venv/bin/python ] || die "run ./lab.sh setup first"
+    mkdir -p logs
+    "$0" arm "${arm_args[@]}" >"$log" 2>&1 &
+    local arm=$!
+    trap 'trap - EXIT INT TERM; kill -INT '"$arm"' 2>/dev/null || true; wait '"$arm"' 2>/dev/null || true' EXIT INT TERM
+    echo "Starting the arm. It rises to its home pose by itself: keep clear. (Its messages go to $log)"
+    until grep -qE '^ARM (AWAKE|NOT READY)' "$log"; do
+        kill -0 "$arm" 2>/dev/null || { tail -20 "$log" >&2; die "the arm side stopped: see above"; }
+        sleep 1
+    done
+    grep -q '^ARM AWAKE' "$log" || { tail -20 "$log" >&2; die "the arm isn't ready: see above"; }
+    echo "Arm is up. Open http://localhost:8081 and press Start. Ctrl-C here stops everything."
+    "$0" python runner.py --participant "$participant" --vision "$vision" "$@"
+}
+
+cmd_cmd() {  # one /arm/cmd, then wait for its done / failed on /arm/status
+    [ -n "${1:-}" ] || die "usage: ./lab.sh cmd '{\"op\": \"home\"}'"
+    source_ros
+    local out; out=$(mktemp)
+    PYTHONUNBUFFERED=1 ros2 topic echo /arm/status --field data >"$out" 2>/dev/null &
+    local echo_pid=$!
+    trap "kill $echo_pid 2>/dev/null || true; rm -f '$out'" EXIT   # expanded now: the locals are gone at exit
+    sleep 2     # the echo has to be listening before the command's first answer
+    timeout 15 ros2 topic pub --once /arm/cmd std_msgs/msg/String "{data: '$1'}" >/dev/null \
+        || die "nothing listens on /arm/cmd: is ./lab.sh arm running?"
+    for _ in $(seq 240); do     # 2 minutes: the slowest move is a long wake
+        if grep -E '"state": "(done|failed)"' "$out"; then
+            ! grep -q '"state": "failed"' "$out"; return
+        fi
+        sleep 0.5
+    done
+    die "no answer on /arm/status in 2 minutes"
 }
 
 cmd_torque_off() {
@@ -128,8 +170,10 @@ cmd="${1:-}"
 [ $# -eq 0 ] || shift
 case "$cmd" in
     setup) cmd_setup ;;
+    run) cmd_run "$@" ;;
     arm) cmd_arm "$@" ;;
+    cmd) cmd_cmd "$@" ;;
     torque-off) cmd_torque_off ;;
     python) cmd_python "$@" ;;
-    *) sed -n '2,6p' "$0"; exit 2 ;;
+    *) sed -n '2,9p' "$0"; exit 2 ;;
 esac
