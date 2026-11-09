@@ -48,8 +48,7 @@ Plug in both cameras too, if they aren't already.
 
 A window opens.
 
-1. **Setup tab:** type the two camera numbers shown after "Cameras found" (left and right). Set the board's real
-   square size and thickness. Press **Connect**.
+1. **Setup tab:** press **Use the Basler cameras**. Set the board's real square size and thickness. Press **Connect**.
 2. **Stereo tab:** hold the checkerboard in view of both cameras and press capture, 15 to 25 times, at different
    angles and in different corners of the image. Press calibrate. The RMS must be **under 0.5**.
 3. **Table pose tab:** lay the board flat on the table in front of the arm, seen by both cameras. Press
@@ -135,6 +134,9 @@ Four pieces sorted into their zones means **the robot works**.
 | `no permission on /dev/ttyUSB0` | `sudo chmod 666 /dev/ttyUSB0` |
 | `home` refuses, "cannot be lifted by a command" | Stop `./lab.sh arm`, lift the arm by hand, start it again |
 | A camera won't open | Close `calib_gui.py`. Only one program can use a camera at a time |
+| "Cameras found: none" for the Basler cameras (USB) | `echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="2676", MODE="0666"' \| sudo tee /etc/udev/rules.d/69-basler.rules`, then `sudo udevadm control --reload-rules`, and replug them |
+| Basler cameras not found (network models) | They need an IP on the PC's network: ask the lab staff, or set it in Basler's pylon Viewer |
+| Basler image too dark or colours shifting | Exposure and white balance are automatic: add light, and don't change it during a session |
 | Only one camera available | `calib_gui.py --one-camera` tries out the GUI, but can't be used for the real run |
 | "Camera gave no image" | Plug the two cameras into different USB ports |
 | A colour isn't detected | Check the lighting, then tune the HSV ranges in `pieces.py` |

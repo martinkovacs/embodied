@@ -33,7 +33,7 @@ from nicegui import app, run, ui
 
 import pieces
 import stereo_calib as sc
-from cameras import DATA, SETTINGS_PATH, STAGES, TEST_DATA, TEST_FILES, Source, list_cameras, load_settings
+from cameras import BASLER, DATA, SETTINGS_PATH, STAGES, TEST_DATA, TEST_FILES, Source, list_cameras, load_settings
 
 PREVIEW_W = 640
 PORT = 8080
@@ -380,7 +380,15 @@ def root():
                         ui.switch("Test mode: image files instead of cameras").bind_value(S.settings, "test_mode")
                     with ui.column().classes("w-full gap-1").bind_visibility_from(S.settings, "test_mode", value=False):
                         found = ui.label(cameras_found()).classes("text-sm opacity-70")
-                        ui.switch("One camera (testing only): uses the left camera number for both views") \
+
+                        def use_basler():
+                            found.text = cameras_found()
+                            cams = [spec for spec, _ in list_cameras() if spec.startswith(BASLER)]
+                            if cams:
+                                S.settings.update(left=cams[0], right=cams[-1])
+                            ui.notify(f"{len(cams)} Basler camera(s) found", type="positive" if len(cams) == 2 else "warning")
+                        ui.button("Use the Basler cameras", icon="photo_camera", on_click=use_basler).props("outline dense")
+                        ui.switch("One camera (testing only): uses the left camera for both views") \
                             .bind_value(S.settings, "one_camera")
                         with ui.row().classes("w-full"):
                             ui.input("Left camera").bind_value(S.settings, "left").classes("flex-1")

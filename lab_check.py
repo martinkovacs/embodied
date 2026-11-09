@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import time
 from math import isfinite
+from pathlib import Path
 
 import numpy as np
 
@@ -137,8 +138,9 @@ def check_cameras():
         raise Fail("calib_gui.py is in one-camera mode: switch it off in Setup and press Connect")
     have = cameras.list_cameras()
     for side in ("left", "right"):
-        if int(st[side]) not in [i for i, _ in have]:
-            raise Fail(f"{side} camera is {st[side]}, but the cameras found are {have}: fix it in calib_gui.py Setup")
+        if st[side] not in [spec for spec, _ in have]:
+            raise Fail(f"{side} camera is {st[side]}, but the cameras found are {have or 'none'}: in calib_gui.py Setup "
+                       "press Use the Basler cameras. None found: see LAB_GUIDE.md")
     if st["left"] == st["right"]:
         raise Fail("left and right are the same camera: fix it in calib_gui.py Setup")
     try:
@@ -152,12 +154,18 @@ def check_cameras():
         for side, img in (("left", left), ("right", right)):
             if img.mean() < 8:
                 raise Fail(f"the {side} image is black: lens cap, or no light?")
+            if np.ptp(img.astype(int), axis=2).max() == 0:
+                raise Fail(f"the {side} image has no colour: the pieces can't be told apart with a mono camera")
         found, _ = vision.detect()
     finally:
         for s in vision.sources:
             s.release()
     colors = {c: sum(p[0] == c for p in found) for c in runner.COLORS}
-    return f"{left.shape[1]}x{left.shape[0]}, pieces seen by both: " + " ".join(f"{c} {n}" for c, n in colors.items())
+    detail = f"{left.shape[1]}x{left.shape[0]}, pieces seen by both: " + " ".join(f"{c} {n}" for c, n in colors.items())
+    usb = Path("/sys/module/usbcore/parameters/usbfs_memory_mb")
+    if str(st["left"]).startswith(cameras.BASLER) and usb.exists() and int(usb.read_text()) < 1000:
+        raise Warn(f"{detail}. USB cameras only: if frames drop, sudo sh -c 'echo 1000 > {usb}'")
+    return detail
 
 
 def check_frame():

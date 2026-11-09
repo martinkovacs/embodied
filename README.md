@@ -22,6 +22,8 @@ against the simulator, the ROBOTIS fake hardware, or the real arm: only `--host`
 
 ## 1. Setup (once)
 
+The lab's cameras are Basler a2A1920, read through `pypylon` (OpenCV can't see them; webcams still work by number).
+
 Needs: Docker Desktop, Python 3.11+ (3.13 and 3.14 tested), git. Works on Apple Silicon (the container is amd64 and
 runs under Rosetta, because Gazebo Classic has no arm64 build) and on Linux.
 
