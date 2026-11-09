@@ -8,8 +8,13 @@ Sources are two cameras, or in test mode image files that stand in for them: one
 Captured pairs, settings and calib.json live in calib_data/, so a session can be resumed. In test mode the pairs and
 calib.json live in synthetic/gui/ instead, so test images can never end up in the lab's calibration.
 
+One camera (--one-camera, or the switch in Setup) tries the whole flow with a single camera, for testing only: it shows
+in both views, calibrates as one camera, and positions come from the table plane because one view has no depth. Its
+data stays in synthetic/gui/one_camera/, where the runner never looks.
+
 Run:  venv/bin/python calib_gui.py             (opens its own app window, dark mode)
       venv/bin/python calib_gui.py --browser   (only serve on http://localhost:8080)
+      venv/bin/python calib_gui.py --one-camera
 """
 import base64
 import json
@@ -61,7 +66,9 @@ class State:
 
     @property
     def data(self):
-        return TEST_DATA if self.settings["test_mode"] else DATA
+        if self.settings["test_mode"]:
+            return TEST_DATA
+        return TEST_DATA / "one_camera" if self.settings["one_camera"] else DATA
 
     @property
     def pairs_dir(self):
@@ -108,6 +115,9 @@ class State:
                         self.sources[st] = tuple(Source(self.settings[f"test_{st}_{side}"], w, h) for side in ("left", "right"))
                     except RuntimeError as e:
                         errors.append(f"{STAGES[st]}: {e}")
+            elif self.settings["one_camera"]:
+                cam = Source(self.settings["left"], w, h)
+                self.sources = {st: (cam, cam) for st in STAGES}
             else:
                 pair = (Source(self.settings["left"], w, h), Source(self.settings["right"], w, h))
                 self.sources = {st: pair for st in STAGES}
@@ -119,6 +129,10 @@ class State:
             left, right = self.pair(stage)
             if left is None:
                 return None, None
+            if left is right:  # one camera: a second grab would only throw a frame away
+                left.grab()
+                frame = left.retrieve()
+                return frame, None if frame is None else frame.copy()
             left.grab()
             right.grab()
             return left.retrieve(), right.retrieve()
@@ -223,7 +237,19 @@ def load_saved_pairs():
             S.image_size = (left.shape[1], left.shape[0])
 
 
+def calibrate_one_camera():
+    """Both "cameras" are the same one. 1 mm stands in for the baseline only so rectification doesn't divide by zero."""
+    cam, errs = sc.calibrate_camera([p.left for p in S.pairs], S.image_size, S.pattern, S.square)
+    for p, e in zip(S.pairs, errs):
+        p.err_l = p.err_r = p.err_stereo = e
+    table = S.calib.T_left_table if S.calib is not None else None
+    S.calib = sc.StereoCalib(cam, cam, np.eye(3), np.array([-1.0, 0.0, 0.0]), cam.rms, table, S.pattern, S.square)
+    S.save_calib()
+
+
 def calibrate():
+    if S.settings["one_camera"] and not S.settings["test_mode"]:
+        return calibrate_one_camera()
     pat, sq = S.pattern, S.square
     left, errs_l = sc.calibrate_camera([p.left for p in S.pairs], S.image_size, pat, sq)
     right, errs_r = sc.calibrate_camera([p.right for p in S.pairs], S.image_size, pat, sq)
@@ -251,7 +277,11 @@ def capture_table(left, right):
 def detect_both(left, right):
     vl, vr = S.views
     pl, pr = pieces.detect_pieces(left, vl), pieces.detect_pieces(right, vr)
-    return pl, pr, pieces.draw(left, pl, vl), pieces.draw(right, pr, vr), pieces.matched_pieces(S.calib, pl, pr)
+    if S.settings["one_camera"] and not S.settings["test_mode"]:   # no disparity to triangulate from: the table plane
+        matched = [(p, np.array(p.table_mm)) for p in pl]
+    else:
+        matched = pieces.matched_pieces(S.calib, pl, pr)
+    return pl, pr, pieces.draw(left, pl, vl), pieces.draw(right, pr, vr), matched
 
 
 # ---------- UI ----------
@@ -350,6 +380,8 @@ def root():
                         ui.switch("Test mode: image files instead of cameras").bind_value(S.settings, "test_mode")
                     with ui.column().classes("w-full gap-1").bind_visibility_from(S.settings, "test_mode", value=False):
                         found = ui.label(cameras_found()).classes("text-sm opacity-70")
+                        ui.switch("One camera (testing only): uses the left camera number for both views") \
+                            .bind_value(S.settings, "one_camera")
                         with ui.row().classes("w-full"):
                             ui.input("Left camera").bind_value(S.settings, "left").classes("flex-1")
                             ui.input("Right camera").bind_value(S.settings, "right").classes("flex-1")
@@ -753,6 +785,8 @@ def root():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
+    if "--one-camera" in sys.argv:
+        S.settings["one_camera"] = True
     S.load_data()
     try:
         S.connect()  # reconnect the sources from the last session

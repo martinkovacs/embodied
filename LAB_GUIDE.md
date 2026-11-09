@@ -135,6 +135,7 @@ Four pieces sorted into their zones means **the robot works**.
 | `no permission on /dev/ttyUSB0` | `sudo chmod 666 /dev/ttyUSB0` |
 | `home` refuses, "cannot be lifted by a command" | Stop `./lab.sh arm`, lift the arm by hand, start it again |
 | A camera won't open | Close `calib_gui.py`. Only one program can use a camera at a time |
+| Only one camera available | `calib_gui.py --one-camera` tries out the GUI, but can't be used for the real run |
 | "Camera gave no image" | Plug the two cameras into different USB ports |
 | A colour isn't detected | Check the lighting, then tune the HSV ranges in `pieces.py` |
 | "Closed on nothing" with a piece in the gripper | Lower `EMPTY_MARGIN` in `arm_node.py`, and restart `./lab.sh arm` |

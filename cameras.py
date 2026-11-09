@@ -26,7 +26,7 @@ TEST_FILES = {"calib": ("synthetic/calib/left_*.png", "synthetic/calib/right_*.p
               "table": ("synthetic/table_left.png", "synthetic/table_right.png"),
               "scene": ("synthetic/scene_left.png", "synthetic/scene_right.png")}
 DEFAULTS = {"left": "0", "right": "1", "width": 1280, "height": 960,
-            "cols": 9, "rows": 6, "square_mm": 25.0, "board_mm": 0.0, "test_mode": False,
+            "cols": 9, "rows": 6, "square_mm": 25.0, "board_mm": 0.0, "test_mode": False, "one_camera": False,
             **{f"test_{st}_{side}": TEST_FILES[st][i] for st in STAGES for i, side in enumerate(("left", "right"))}}
 
 # grab() past the frames a webcam queued while nobody read; a single grab() after a pause returns a stale frame

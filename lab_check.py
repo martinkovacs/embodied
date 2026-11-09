@@ -133,6 +133,8 @@ def check_cameras():
     st = cameras.load_settings()
     if st["test_mode"]:
         raise Fail("calib_gui.py is in test mode: switch it off in Setup and press Connect")
+    if st["one_camera"]:
+        raise Fail("calib_gui.py is in one-camera mode: switch it off in Setup and press Connect")
     have = cameras.list_cameras()
     for side in ("left", "right"):
         if int(st[side]) not in [i for i, _ in have]:
