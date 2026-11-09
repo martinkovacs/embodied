@@ -88,7 +88,8 @@ A window opens.
 ./lab.sh python robot_frame.py --check
 ```
 
-6. Take the board away. Support the arm, go to the first terminal, press Ctrl-C, and start `./lab.sh arm` again.
+6. Take the board away. Lay the arm down and **take your hands off it**. In the first terminal press Ctrl-C and
+   start `./lab.sh arm` again: the arm rises to its home pose by itself.
 
 ## 6. Make the layout and place the pieces
 

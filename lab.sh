@@ -117,14 +117,16 @@ cmd_arm() {
 
 cmd_run() {
     [ -n "${1:-}" ] || die "usage: ./lab.sh run PARTICIPANT [--fake] [runner.py options]"
-    local participant=$1 arm_args=() vision=cameras log=logs/arm_side.log
+    local participant=$1 arm_args=() vision=cameras log
+    log=logs/arm_side_$(date +%Y%m%d_%H%M%S).log    # one per run: the arm's errors are what a failed session leaves
     shift
     if [ "${1:-}" = "--fake" ]; then arm_args=(--fake); vision=synthetic; shift; fi
     [ -x venv/bin/python ] || die "run ./lab.sh setup first"
     mkdir -p logs
-    "$0" arm "${arm_args[@]}" >"$log" 2>&1 &
+    # its own process group: when the ROS side dies it kills its group, and the runner must stay up to show why
+    setsid "$0" arm "${arm_args[@]}" >"$log" 2>&1 &
     local arm=$!
-    trap 'trap - EXIT INT TERM; kill -INT '"$arm"' 2>/dev/null || true; wait '"$arm"' 2>/dev/null || true' EXIT INT TERM
+    trap 'trap - EXIT INT TERM HUP; kill -INT -- -'"$arm"' 2>/dev/null || true; wait '"$arm"' 2>/dev/null || true' EXIT INT TERM HUP
     echo "Starting the arm. It rises to its home pose by itself: keep clear. (Its messages go to $log)"
     until grep -qE '^ARM (AWAKE|NOT READY)' "$log"; do
         kill -0 "$arm" 2>/dev/null || { tail -20 "$log" >&2; die "the arm side stopped: see above"; }

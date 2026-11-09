@@ -5,7 +5,8 @@
              op: pick | place | hover (x, y, z) | show | home | open | stop | wake
              air: true (optional) makes a dry run of the command: slow, pick / place stop AIR_MM above the piece
              hover: the fingertips go to the approach height over (x, y), always slowly, and stay there
-             wake: slowly up to home from wherever the arm lies, never lower than it is (startup, clear table)
+             wake: slowly up to home from wherever the arm lies, never lower than it is: straight up like a home
+                   when that works, otherwise joint by joint, which can sweep sideways (startup, clear table)
 /arm/status  std_msgs/String JSON  {"id": 7, "state": "started" | "done" | "failed", "reason": "..."}
 
 One command at a time: another one arriving meanwhile fails with "busy". stop cancels the running motion and
@@ -215,7 +216,15 @@ class ArmNode(Node):
         if op == "home":
             await self.travel(HOME, self.table_z)
         elif op == "wake":
-            await self.move(wake_path(self.joints()))
+            q = self.joints()
+            try:    # home's own way up when it has one: straight up, so nothing next to the arm is swept aside
+                lift = [] if fk(q)[2] >= self.table_z + CLEAR else lift_path(q, self.table_z, self.op_xy)
+                check_travel(lift[-1] if lift else q, HOME, self.table_z)
+                moves = [lift, [HOME]] if lift else [[HOME]]
+            except ValueError:
+                moves = [wake_path(q)]
+            for points in moves:
+                await self.move(points)
         elif op == "show":
             await self.travel(SHOW, self.table_z)
         elif op == "open":
