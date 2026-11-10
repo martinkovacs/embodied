@@ -38,7 +38,7 @@ from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 from arm_node.kinematics import (CLEAR, GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, check_travel, fk, lift_path,
-                                 vertical, wake_path)
+                                 vertical, wake_moves)
 
 JOINTS = ["joint1", "joint2", "joint3", "joint4"]
 OPEN, CLOSED = 0.019, -0.01     # gripper_left_joint limits, m; closing on a piece just stalls on it
@@ -51,6 +51,7 @@ GOAL_ACCEPT_S = 5.0             # a live controller answers this fast
 CANCEL_ACK_S = 2.0              # stop: how long the controller may take to answer its cancel request
 RESULT_EXTRA_S = 5.0            # arm goal result: trajectory duration + this
 GRIP_RESULT_S = 5.0             # gripper goal result
+ARRIVE_RAD = 0.15               # a finished move must have brought every joint this close to its target
 JOINT_STALE_S = 1.0             # /joint_states: without a reading fresher than this, nothing may move
 
 
@@ -216,14 +217,7 @@ class ArmNode(Node):
         if op == "home":
             await self.travel(HOME, self.table_z)
         elif op == "wake":
-            q = self.joints()
-            try:    # home's own way up when it has one: straight up, so nothing next to the arm is swept aside
-                lift = [] if fk(q)[2] >= self.table_z + CLEAR else lift_path(q, self.table_z, self.op_xy)
-                check_travel(lift[-1] if lift else q, HOME, self.table_z)
-                moves = [lift, [HOME]] if lift else [[HOME]]
-            except ValueError:
-                moves = [wake_path(q)]
-            for points in moves:
+            for points in wake_moves(self.joints(), self.table_z, self.op_xy):
                 await self.move(points)
         elif op == "show":
             await self.travel(SHOW, self.table_z)
@@ -252,6 +246,9 @@ class ArmNode(Node):
             await self.move(descent)
             if op == "pick":
                 res = await self.grip(CLOSED)
+                # shortcut: likely never triggers: the controller's default goal_tolerance (10 mm) ends the close
+                # as soon as the jaws pass 0, so the position here is far from CLOSED either way. The runner's
+                # camera check catches a miss. Check the reported position on the real arm before relying on it.
                 pos = getattr(res.result, "position", None)     # absent (fake hardware): skip the check
                 if not air and pos is not None and pos <= CLOSED + EMPTY_MARGIN:   # jaws at the limit: nothing there
                     await self.move(ascent)                     # clear the piece level before failing
@@ -289,6 +286,12 @@ class ArmNode(Node):
         res = await self.send(self.arm, goal, total + RESULT_EXTRA_S, "arm goal")
         if res.status != GoalStatus.STATUS_SUCCEEDED:
             raise RuntimeError(f"arm controller: status {res.status} {res.result.error_string}")
+        # the ROBOTIS controller runs open loop: it reports success on time alone, also for motors that never moved
+        q = self.joints()
+        if max(abs(a - b) for a, b in zip(q, points[-1])) > ARRIVE_RAD:
+            raise RuntimeError(f"the arm did not get there: joints {[round(v, 2) for v in q]}, target "
+                               f"{[round(v, 2) for v in points[-1]]}. A blinking motor LED means overload: "
+                               "switch the arm's power off and on, then restart ./lab.sh arm")
 
     async def grip(self, position):
         goal = GripperCommand.Goal()

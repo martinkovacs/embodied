@@ -84,8 +84,7 @@ def vertical(x, y, z_from, z_to, step=5.0):
     return out
 
 
-LIFT_RECOVERY = ("turn the torque off, move the arm up by hand, then restart the bringup (robot_frame.py's "
-                 "docstring)")
+LIFT_RECOVERY = "hold the arm, ./lab.sh torque-off, move it up by hand, then restart ./lab.sh arm"
 
 
 def lift_path(q_now, table_z, op_xy=None):
@@ -95,7 +94,7 @@ def lift_path(q_now, table_z, op_xy=None):
     naming the pose and the hand-lift procedure when no command can do the lift (a home does the same lift)."""
     x, y, z = fk(q_now)
     msg = (f"arm at ({x:.0f}, {y:.0f}, {z:.0f}) mm over the table cannot be lifted by a command (a home does "
-           f"the same lift): {LIFT_RECOVERY}")
+           f"the same lift): clear the table around the arm, then send wake")
     try:
         px, py = (op_xy if op_xy is not None and hypot(x - op_xy[0], y - op_xy[1]) <= 10.0 else (x, y))
         z0 = max(z, table_z + GRASP_Z)
@@ -162,8 +161,9 @@ def wake_path(q_now, q_to=HOME, step=0.1):
         return all(min(heights(q)) >= floor and self_gap(q) >= gap for q in qs)
 
     start, q_to = tuple(q_now), tuple(q_to)
-    if not all(lo <= v <= hi for v, (lo, hi) in zip(start, LIMITS)):    # also catches nan
-        raise ValueError(f"joints {[round(v, 2) for v in start]} are outside their limits")
+    # also catches nan. 0.05 rad of slack: a limp arm resting on a mechanical stop reads just past the URDF limit
+    if not all(lo - 0.05 <= v <= hi + 0.05 for v, (lo, hi) in zip(start, LIMITS)):
+        raise ValueError(f"joints {[round(v, 2) for v in start]} are outside their limits: {LIFT_RECOVERY}")
     came, queue = {(0, 0, 0): None}, [(0, 0, 0)]
     at = lambda k: (start[0], *(start[j + 1] + k[j] * step for j in range(3)))
     for k in queue:                             # appended to while iterating: breadth-first
@@ -181,6 +181,17 @@ def wake_path(q_now, q_to=HOME, step=0.1):
                     came[n] = k
                     queue.append(n)
     raise ValueError(f"no way up from here without going lower first: {LIFT_RECOVERY}")
+
+
+def wake_moves(q, table_z=0.0, op_xy=None):
+    """The trajectories [[q]] of a wake from q: home's own way up when it has one (straight up, so nothing next
+    to the arm is swept aside), otherwise wake_path()."""
+    try:
+        lift = [] if fk(q)[2] >= table_z + CLEAR else lift_path(q, table_z, op_xy)
+        check_travel(lift[-1] if lift else q, HOME, table_z)
+        return [lift, [HOME]] if lift else [[HOME]]
+    except ValueError:
+        return [wake_path(q)]
 
 
 if __name__ == "__main__":
@@ -247,7 +258,7 @@ if __name__ == "__main__":
         try:                                                                            # command can lift, the
             lift_path(q, 0.0)                                                           # straight line digs in
         except ValueError as e:
-            assert "hand" in str(e) and "torque" in str(e) and "home" in str(e), str(e)
+            assert "wake" in str(e) and "home" in str(e), str(e)
         else:
             raise AssertionError(f"{q} should be unrecoverable by lift_path")
     assert self_gap(home) > SELF_CLEAR and self_gap(show) > SELF_CLEAR
@@ -268,4 +279,10 @@ if __name__ == "__main__":
         pass
     else:
         raise AssertionError("joints outside their limits should be refused")
+    assert wake_path((0.0, 1.0, 1.43, 0.0))[-1] == home         # resting on joint3's end stop, just past its limit
+    assert wake_moves(home) == [[HOME]]
+    low = ik(J1_X + 150.0, 40.0, GRASP_Z + 10.0)                # a low pose home can lift: straight up, then home
+    assert wake_moves(low) == [lift_path(low, 0.0), [HOME]]
+    lying = (0.0, 1.5, -1.2, -0.2)                              # one it can't: joint by joint
+    assert wake_moves(lying) == [wake_path(lying)]
     print("kinematics ok")

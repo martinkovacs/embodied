@@ -13,7 +13,7 @@ cd embodied
 ./lab.sh setup
 ```
 
-It takes a few minutes. If it says packages are missing, run the command it prints (or ask the lab staff), then
+It asks for the sudo password once, to install the arm's USB rule, and takes a few minutes. If it says packages are missing, run the command it prints (or ask the lab staff), then
 run `./lab.sh setup` again. It should end with `Setup finished.`
 
 ## 2. Start the arm
@@ -30,7 +30,14 @@ Wait for `ARM SIDE READY`. The arm then **rises slowly to its home pose by itsel
 that is the sign that it works. If it stays down, the line above the warning says why.
 
 **Leave this terminal running.** Everything below goes in a **second terminal**
-(`cd embodied` first). To stop the arm side, press Ctrl-C here.
+(`cd embodied` first).
+
+Two rules for every start and stop of the arm side, today and later:
+
+- **Starting:** no pieces near the arm. It may sweep sideways while it gets up. Pieces go on the table after it is up.
+- **Stopping (Ctrl-C):** hold the arm first, or let it rest on the table. Its motors let go and it falls.
+  Never just close the terminal: the motors then stay on, and the next start refuses with
+  `Torque is enabled, cannot proceed` until the arm's power is switched off and on.
 
 ## 3. Check that it moves
 
@@ -88,8 +95,8 @@ A window opens.
 ./lab.sh python robot_frame.py --check
 ```
 
-6. Take the board away. Lay the arm down and **take your hands off it**. In the first terminal press Ctrl-C and
-   start `./lab.sh arm` again: the arm rises to its home pose by itself.
+6. Take the board away. Lay the arm down and **take your hands off it**. In the first terminal press Ctrl-C, wait
+   a few seconds and start `./lab.sh arm` again: the arm rises to its home pose by itself.
 
 ## 6. Make the layout and place the pieces
 
@@ -98,7 +105,7 @@ A window opens.
 ./lab.sh python lab_layout.py --view --condition smoke
 ```
 
-Put one piece on each of the 4 thick circles (r1, w1, g1, b1). The circle gets thicker when the camera sees the
+The arm must be up before the pieces go on the table. Put one piece on each of the 4 thick circles (r1, w1, g1, b1). The circle gets thicker when the camera sees the
 right colour there. White pieces need a dark mat under them. Press **q** when all 4 are thick.
 
 If some circles are off the table, add `--bounds XMIN XMAX YMIN YMAX` (table mm) to the first command.
@@ -139,13 +146,36 @@ The same command without `--air`:
 
 Four pieces sorted into their zones means **the robot works**.
 
+## Every later session
+
+Once steps 1 to 10 have worked, a session is one command in one terminal. Stop `./lab.sh arm` first if it is
+still running.
+
+1. Table clear of pieces, arm powered on.
+2. Start it. The arm rises by itself; if it doesn't, the reason is printed.
+
+```bash
+./lab.sh run P07
+```
+
+3. When it says `Arm is up`, lay out the pieces, open <http://localhost:8081> and press **Start**.
+4. At the end: hold the arm, then Ctrl-C.
+
+Options of `runner.py` go after the participant, for example `./lab.sh run TEST --no-speech --air`.
+
 ## If something goes wrong
 
 | What you see | What to do |
 |---|---|
 | `/dev/ttyUSB0 doesn't exist` | Check the arm's USB cable and power |
-| `no permission on /dev/ttyUSB0` | `sudo chmod 666 /dev/ttyUSB0` |
-| `home` refuses, "cannot be lifted by a command" | Take the pieces away, then `./lab.sh cmd '{"op": "wake"}'` |
+| `no permission on /dev/ttyUSB0` | `./lab.sh usb` (installs the USB rule, asks for the sudo password) |
+| The arm is jerky, or the controllers don't start | `cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer` must print `1`. If not: `./lab.sh usb` |
+| `ARM NOT READY: the controllers aren't active` | Look above it for `Torque is enabled, cannot proceed`: hold the arm, switch its power off and on, start again. `Cannot connect` or no motor found: the arm's power and the cable from the USB adapter to the motors |
+| `the ROS side is already running` | Ctrl-C in the terminal that runs `./lab.sh arm` or `./lab.sh run`, wait a few seconds |
+| `the arm did not get there` | A motor gave up. If a motor LED blinks: overload, switch the arm's power off and on, then restart. Otherwise something blocks the arm |
+| `joints ... are outside their limits` | The arm lies past an end stop: `./lab.sh torque-off`, move it a little by hand, restart `./lab.sh arm` |
+| No motor LED blinks once when the power is switched on | Power supply or the cable chain between the motors, not software |
+| `home` refuses, "cannot be lifted by a command" | Take the pieces near the arm away, then `./lab.sh cmd '{"op": "wake"}'` |
 | The arm doesn't rise after `ARM SIDE READY` | Read the reason printed there. "controller not running": power and USB of the arm, then restart `./lab.sh arm` |
 | A camera won't open | Close `calib_gui.py`. Only one program can use a camera at a time |
 | "Cameras found: none" for the Basler cameras (USB) | `echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="2676", MODE="0666"' \| sudo tee /etc/udev/rules.d/69-basler.rules`, then `sudo udevadm control --reload-rules`, and replug them |
@@ -155,5 +185,6 @@ Four pieces sorted into their zones means **the robot works**.
 | "Camera gave no image" | Plug the two cameras into different USB ports |
 | A colour isn't detected | Check the lighting, then tune the HSV ranges in `pieces.py` |
 | "Closed on nothing" with a piece in the gripper | Lower `EMPTY_MARGIN` in `arm_node.py`, and restart `./lab.sh arm` |
+| An empty gripper isn't noticed by the arm | Expected for now: the cameras catch the miss. Not yet tuned on the real arm |
 | The fingers hit the table or miss the piece | Press STOP, then adjust `GRASP_Z` in `kinematics.py` and restart `./lab.sh arm` |
 | Anything alarming | Power switch |

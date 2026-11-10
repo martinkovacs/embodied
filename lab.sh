@@ -6,15 +6,18 @@
 #   ./lab.sh arm [--fake]      only the ROS side, left running (--fake: simulated joints, no arm)
 #   ./lab.sh cmd '{"op": "home"}'   send the arm one command and print its answer (ops: arm_node.py's docstring)
 #   ./lab.sh torque-off        let the arm be moved by hand (afterwards restart ./lab.sh arm)
+#   ./lab.sh usb               install the arm's USB rule (setup does it; needs sudo)
 #   ./lab.sh python X.py ...   run one of our Python scripts
 set -euo pipefail
-cd "$(dirname "$(readlink -f "$0")")"
+SELF=$(readlink -f "$0")        # absolute: the script calls itself after the cd
+cd "$(dirname "$SELF")"
 
 export ROS_LOCALHOST_ONLY=1     # everything runs on this PC: never see, or drive, another group's arm on the network
 PYTHON=3.13                     # Humble's system Python (3.10) is too old for requirements.txt
 PORT=/dev/ttyUSB0
 ROBOTIS=(DynamixelSDK dynamixel_interfaces dynamixel_hardware_interface open_manipulator)   # as in docker/Dockerfile
-APT_ALWAYS=(curl git ros-humble-rosbridge-suite)
+APT_ALWAYS=(curl git python3-colcon-common-extensions ros-humble-rosbridge-suite)
+USB_RULE=/etc/udev/rules.d/99-open-manipulator-cdc.rules
 APT_ROBOTIS=(libboost-all-dev ros-humble-gazebo-ros-pkgs ros-humble-gazebo-ros2-control ros-humble-ros2-control
              ros-humble-ros2-controllers ros-humble-gripper-controllers ros-humble-moveit ros-humble-xacro)
 
@@ -37,6 +40,11 @@ source_ros() {
     set -u
 }
 
+cmd_usb() {  # the ROBOTIS quick start's rule: USB latency 16 ms -> 1 ms (the default is too slow), port open to all users
+    echo 'KERNEL=="ttyUSB*", DRIVERS=="ftdi_sio", MODE="0666", ATTR{device/latency_timer}="1"' | sudo tee "$USB_RULE" >/dev/null
+    sudo udevadm control --reload-rules && sudo udevadm trigger
+}
+
 missing_apt() { local p; for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || echo -n "$p "; done; }
 
 cmd_setup() {
@@ -47,6 +55,8 @@ cmd_setup() {
     if [ -z "$w" ]; then need+=$(missing_apt "${APT_ROBOTIS[@]}"); fi
     [ -z "$need" ] || die "these packages are missing. Run this (or ask the lab staff), then run setup again:
     sudo apt-get update && sudo apt-get install -y $need"
+    # first, so the sudo password is asked while someone is still watching
+    [ -e "$USB_RULE" ] || cmd_usb || echo "NOTE: the arm's USB rule isn't installed. Ask the lab staff to run: ./lab.sh usb"
 
     if [ -z "$w" ]; then
         echo "== Building the ROBOTIS packages in $HOME/omx_ws (takes a few minutes)"
@@ -71,44 +81,50 @@ cmd_setup() {
     (cd ros_ws && colcon build --symlink-install)
 
     echo "== Self-tests (about a minute)"
-    "$0" python runner.py --self-test | tail -1
-    "$0" python robot_frame.py --self-test
-    "$0" python speech.py --self-test
-    "$0" python ros_ws/src/arm_node/arm_node/kinematics.py
+    "$SELF" python runner.py --self-test | tail -1
+    "$SELF" python robot_frame.py --self-test
+    "$SELF" python speech.py --self-test
+    "$SELF" python ros_ws/src/arm_node/arm_node/kinematics.py
 
-    id -nG | grep -qwE 'dialout|uucp' || echo "NOTE: you aren't in the dialout group. If ./lab.sh arm can't open $PORT:
-    sudo chmod 666 $PORT"
     echo "Setup finished."
 }
 
 cmd_arm() {
     source_ros
     [ -f ros_ws/install/setup.bash ] || die "run ./lab.sh setup first"
+    # two drivers on one serial port, and two arm_nodes running every command
+    ! pgrep -f ros2_control_node >/dev/null || die "the ROS side is already running (or still stopping). Stop it with
+    Ctrl-C in its terminal, wait a few seconds, then start again."
     local fake=false
     if [ "${1:-}" = "--fake" ]; then
         fake=true
     else
         [ -e "$PORT" ] || die "$PORT doesn't exist: is the arm's USB adapter plugged in and powered?"
-        [ -r "$PORT" ] && [ -w "$PORT" ] || die "no permission on $PORT. Run: sudo chmod 666 $PORT"
+        [ -r "$PORT" ] && [ -w "$PORT" ] || die "no permission on $PORT. Run: ./lab.sh usb"
     fi
     ros2 daemon stop >/dev/null 2>&1 || true    # a daemon left over from a killed session answers nothing, and
                                                 # the readiness check below would never see the controllers
     trap 'trap - EXIT INT TERM; echo "Stopping the ROS side."; kill 0 2>/dev/null || true' EXIT INT TERM
+    echo "The arm will rise by itself and can sweep sideways: NO PIECES near it until it is up."
     ros2 launch arm_node lab.launch.py fake:=$fake &
     local launch=$!
     (
         for _ in $(seq 40); do
-            if [ "$(ros2 control list_controllers 2>/dev/null | grep -v inactive | grep -c active)" -ge 3 ]; then
+            # timeout: without a controller manager the call itself waits 10 s
+            if [ "$(timeout 5 ros2 control list_controllers 2>/dev/null | grep -v inactive | grep -c active)" -ge 3 ]; then
                 echo "=========================================================="
                 echo " ARM SIDE READY. Leave this running, open a second terminal."
                 echo " The arm now rises slowly to its home pose: keep clear."
+                echo " Before Ctrl-C here: HOLD THE ARM, its motors let go."
                 echo "=========================================================="
-                if "$0" cmd '{"op": "wake"}'; then echo "ARM AWAKE"; else echo "ARM NOT READY: it didn't wake up, see the reason above."; fi
+                if "$SELF" cmd '{"op": "wake"}'; then echo "ARM AWAKE"; else echo "ARM NOT READY: it didn't wake up, see the reason above."; fi
                 exit 0
             fi
             sleep 2
         done
-        echo "ARM NOT READY: the controllers aren't active after 80 s, check the errors above."
+        echo "ARM NOT READY: the controllers aren't active, check the errors above.
+    'Torque is enabled, cannot proceed': hold the arm, switch its power off and on, start again.
+    'Cannot connect' / no motor found: the arm's power, and the cable from the USB adapter to the motors."
     ) &
     wait "$launch" || true
     echo "ERROR: the ROS side stopped: see the messages above." >&2
@@ -118,23 +134,26 @@ cmd_arm() {
 cmd_run() {
     [ -n "${1:-}" ] || die "usage: ./lab.sh run PARTICIPANT [--fake] [runner.py options]"
     local participant=$1 arm_args=() vision=cameras log
+    why() { grep -iE 'error|torque is enabled|ARM NOT READY|"failed"' -A2 "$log" | tail -25 >&2 || tail -20 "$log" >&2; }
     log=logs/arm_side_$(date +%Y%m%d_%H%M%S).log    # one per run: the arm's errors are what a failed session leaves
     shift
     if [ "${1:-}" = "--fake" ]; then arm_args=(--fake); vision=synthetic; shift; fi
     [ -x venv/bin/python ] || die "run ./lab.sh setup first"
     mkdir -p logs
     # its own process group: when the ROS side dies it kills its group, and the runner must stay up to show why
-    setsid "$0" arm "${arm_args[@]}" >"$log" 2>&1 &
+    setsid "$SELF" arm "${arm_args[@]}" >"$log" 2>&1 &
     local arm=$!
     trap 'trap - EXIT INT TERM HUP; kill -INT -- -'"$arm"' 2>/dev/null || true; wait '"$arm"' 2>/dev/null || true' EXIT INT TERM HUP
-    echo "Starting the arm. It rises to its home pose by itself: keep clear. (Its messages go to $log)"
+    echo "Starting the arm. It rises to its home pose by itself and can sweep sideways: NO PIECES near it yet."
+    echo "(Its messages go to $log)"
     until grep -qE '^ARM (AWAKE|NOT READY)' "$log"; do
-        kill -0 "$arm" 2>/dev/null || { tail -20 "$log" >&2; die "the arm side stopped: see above"; }
+        kill -0 "$arm" 2>/dev/null || { why; die "the arm side stopped: see above, all of it is in $log"; }
         sleep 1
     done
-    grep -q '^ARM AWAKE' "$log" || { tail -20 "$log" >&2; die "the arm isn't ready: see above"; }
-    echo "Arm is up. Open http://localhost:8081 and press Start. Ctrl-C here stops everything."
-    "$0" python runner.py --participant "$participant" --vision "$vision" "$@"
+    grep -q '^ARM AWAKE' "$log" || { why; die "the arm isn't ready: see above, all of it is in $log"; }
+    echo "Arm is up: now lay out the pieces. Open http://localhost:8081 and press Start."
+    echo "Ctrl-C here stops everything: HOLD THE ARM first, its motors let go."
+    "$SELF" python runner.py --participant "$participant" --vision "$vision" "$@"
 }
 
 cmd_cmd() {  # one /arm/cmd, then wait for its done / failed on /arm/status
@@ -148,8 +167,9 @@ cmd_cmd() {  # one /arm/cmd, then wait for its done / failed on /arm/status
     timeout 15 ros2 topic pub --once /arm/cmd std_msgs/msg/String "{data: '$1'}" >/dev/null \
         || die "nothing listens on /arm/cmd: is ./lab.sh arm running?"
     for _ in $(seq 240); do     # 2 minutes: the slowest move is a long wake
-        if grep -E '"state": "(done|failed)"' "$out"; then
-            ! grep -q '"state": "failed"' "$out"; return
+        # "id": null = the answer to this command, which carries no id (the runner's commands all do)
+        if grep -E '"id": null, "state": "(done|failed)"' "$out"; then
+            ! grep -q '"id": null, "state": "failed"' "$out"; return
         fi
         sleep 0.5
     done
@@ -176,6 +196,7 @@ case "$cmd" in
     arm) cmd_arm "$@" ;;
     cmd) cmd_cmd "$@" ;;
     torque-off) cmd_torque_off ;;
+    usb) cmd_usb ;;
     python) cmd_python "$@" ;;
-    *) sed -n '2,9p' "$0"; exit 2 ;;
+    *) sed -n '2,10p' "$SELF"; exit 2 ;;
 esac

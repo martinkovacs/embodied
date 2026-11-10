@@ -145,8 +145,10 @@ because that would contaminate the conditions. **STOP** halts the arm (and the r
 ## 4. In the lab (real arm, real cameras)
 
 Everything runs on the lab PC: the arm, the cameras, the runner and the panel. **[`LAB_GUIDE.md`](LAB_GUIDE.md) is the
-step-by-step for a first session.** `lab.sh` wraps the commands: `./lab.sh setup` once, `./lab.sh arm` to start the
-ROS side, `./lab.sh python <script>` for our scripts (it keeps ROS's Python 3.10 packages out of our newer Python).
+step-by-step for a first session.** `lab.sh` wraps the commands: `./lab.sh setup` once, `./lab.sh run P07` for a
+whole session (it starts the ROS side, waits until the arm has woken up to its home pose, then runs the experiment),
+`./lab.sh arm` for the ROS side alone, `./lab.sh cmd '{"op": "wake"}'` to send the arm one command,
+`./lab.sh python <script>` for our scripts (it keeps ROS's Python 3.10 packages out of our newer Python).
 ROS stays on this machine (`ROS_LOCALHOST_ONLY=1`) and rosbridge listens on 127.0.0.1 only, so nobody else on the lab
 network can reach or drive the arm, and our commands can't reach another group's. The panel is on 127.0.0.1 too.
 
