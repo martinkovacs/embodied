@@ -116,18 +116,50 @@ def heights(q):
     return elbow, wrist, wrist - TOOL * sin(q2 + q3 + q4)
 
 
+def _seg_gap(a, b, c, d):
+    """Distance between the 2D segments a-b and c-d (0 when they cross)."""
+    def side(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    def to_seg(p, q, r):    # point p to segment q-r
+        vx, vy = r[0] - q[0], r[1] - q[1]
+        t = max(0.0, min(1.0, ((p[0] - q[0]) * vx + (p[1] - q[1]) * vy) / (vx * vx + vy * vy)))
+        return hypot(p[0] - q[0] - t * vx, p[1] - q[1] - t * vy)
+
+    if side(a, b, c) * side(a, b, d) < 0 and side(c, d, a) * side(c, d, b) < 0:
+        return 0.0
+    return min(to_seg(a, c, d), to_seg(b, c, d), to_seg(c, a, b), to_seg(d, a, b))
+
+
+def self_gap(q):
+    """Smallest centre-line distance between arm parts that can meet, in the arm's own vertical plane: the
+    gripper against the upper arm and the base column, and the forearm against the base column."""
+    _, q2, q3, q4 = q
+    base, j2 = (0.0, 0.0), (0.0, J2_Z)
+    j3 = (UP_X * cos(q2) + UP_Z * sin(q2), J2_Z - UP_X * sin(q2) + UP_Z * cos(q2))
+    j4 = (j3[0] + FOREARM * cos(q2 + q3), j3[1] - FOREARM * sin(q2 + q3))
+    tip = (j4[0] + TOOL * cos(q2 + q3 + q4), j4[1] - TOOL * sin(q2 + q3 + q4))
+    return min(_seg_gap(j4, tip, j2, j3), _seg_gap(j4, tip, base, j2), _seg_gap(j3, j4, base, j2))
+
+
+SELF_CLEAR = 45.0               # centre lines this far apart = parts not touching (links ~35-40 mm thick). Measure.
+
+
 def wake_path(q_now, q_to=HOME, step=0.1):
     """Waypoints [q] from wherever the arm lies (resting on the table, folded, moved by hand) up to q_to, along
     which the elbow, wrist and fingertips never go more than 2 mm lower than the lowest of them is now (or, for
     an arm already above q_to, than the lowest of them at q_to): whatever the arm rests on, it only moves away
-    from it. Breadth-first over joint2..4 in `step` rad moves until the
+    from it. The arm doesn't pass through itself either: self_gap() stays above SELF_CLEAR, or above what it is
+    now for an arm that starts folded tighter. Breadth-first over joint2..4 in `step` rad moves until the
     straight joint-space line to q_to is clear; joint1 only turns on that last line. ValueError if there is none.
     shortcut: knows nothing about pieces or anything else standing around the arm, so it is for starting up
     with a clear table, not for use between trials."""
     floor = min(*heights(q_now), *heights(q_to)) - 2.0
+    gap = min(SELF_CLEAR, self_gap(q_now)) - 1.0
 
     def clear(a, b, n):
-        return all(min(heights(tuple(m + (w - m) * i / n for m, w in zip(a, b)))) >= floor for i in range(1, n + 1))
+        qs = (tuple(m + (w - m) * i / n for m, w in zip(a, b)) for i in range(1, n + 1))
+        return all(min(heights(q)) >= floor and self_gap(q) >= gap for q in qs)
 
     start, q_to = tuple(q_now), tuple(q_to)
     if not all(lo <= v <= hi for v, (lo, hi) in zip(start, LIMITS)):    # also catches nan
@@ -218,11 +250,16 @@ if __name__ == "__main__":
             assert "hand" in str(e) and "torque" in str(e) and "home" in str(e), str(e)
         else:
             raise AssertionError(f"{q} should be unrecoverable by lift_path")
-    for q in ((0.17, 1.47, 1.37, 0.21), (-0.61, 0.53, 1.26, -1.45), (1.0, 1.0, 1.0, 1.0), (0.0, 1.2, 0.9, 0.3)):
-        pts, floor = wake_path(q), min(heights(q)) - 2.0           # the poses no command could lift: wake_path does,
-        assert pts[-1] == home, pts                                # and nothing dips on the way to home
+    assert self_gap(home) > SELF_CLEAR and self_gap(show) > SELF_CLEAR
+    assert self_gap((0.0, 1.47, 1.37, 0.21)) == 0.0             # gripper folded back through the base column
+    for q in ((0.0, 1.5, -1.2, -0.2), (-0.61, 0.53, 1.26, -1.45), (1.0, 1.0, 1.0, 1.0), (0.0, 1.2, 0.9, 0.3),
+              (0.0, -1.5, 1.4, 0.3)):                           # lying stretched out, tilted, folded on the base
+        pts, floor = wake_path(q), min(heights(q)) - 2.0        # poses no home could lift: wake_path does, nothing
+        gap = min(SELF_CLEAR, self_gap(q)) - 2.0                # dips on the way and the arm stays clear of itself
+        assert pts[-1] == home, pts
         for a, b in zip([q, *pts], pts):
-            assert min(min(heights(tuple(m + (w - m) * i / 50 for m, w in zip(a, b)))) for i in range(51)) > floor - 1.0
+            for c in (tuple(m + (w - m) * i / 50 for m, w in zip(a, b)) for i in range(51)):
+                assert min(heights(c)) > floor - 1.0 and self_gap(c) > gap, (q, c)
     assert wake_path(home) == [home]
     assert wake_path((0.0, 0.0, 0.0, 0.0)) == [home]            # from above home (fake hardware starts here): down to it
     try:
