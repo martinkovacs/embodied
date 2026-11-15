@@ -144,17 +144,26 @@ cmd_run() {
     mkdir -p logs
     # its own process group: when the ROS side dies it kills its group, and the runner must stay up to show why
     setsid "$SELF" arm "${arm_args[@]}" >"$log" 2>&1 &
-    local arm=$!
-    trap 'trap - EXIT INT TERM HUP; kill -INT -- -'"$arm"' 2>/dev/null || true; wait '"$arm"' 2>/dev/null || true' EXIT INT TERM HUP
+    ARM_PID=$!      # global: the EXIT trap runs after cmd_run has returned
+    # stopping the ROS side drops the arm, also when the runner ends by itself (a typo, a crash): wait for a hand on it
+    stop_arm() {
+        trap - EXIT INT TERM HUP
+        if kill -0 "$ARM_PID" 2>/dev/null && [ -t 0 ]; then
+            read -rp "HOLD THE ARM, then press Enter: stopping lets its motors go. " || true
+        fi
+        kill -INT -- -"$ARM_PID" 2>/dev/null || true
+        wait "$ARM_PID" 2>/dev/null || true
+    }
+    trap stop_arm EXIT INT TERM HUP
     echo "Starting the arm. It rises to its home pose by itself and can sweep sideways: NO PIECES near it yet."
     echo "(Its messages go to $log)"
     until grep -qE '^ARM (AWAKE|NOT READY)' "$log"; do
-        kill -0 "$arm" 2>/dev/null || { why; die "the arm side stopped: see above, all of it is in $log"; }
+        kill -0 "$ARM_PID" 2>/dev/null || { why; die "the arm side stopped: see above, all of it is in $log"; }
         sleep 1
     done
     grep -q '^ARM AWAKE' "$log" || { why; die "the arm isn't ready: see above, all of it is in $log"; }
     echo "Arm is up: now lay out the pieces. Open http://localhost:8081 and press Start."
-    echo "Ctrl-C here stops everything: HOLD THE ARM first, its motors let go."
+    echo "Ctrl-C here stops everything: it asks you to hold the arm first, its motors let go."
     "$SELF" python runner.py --participant "$participant" --vision "$vision" "$@"
 }
 
