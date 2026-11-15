@@ -18,8 +18,10 @@ PORT=/dev/ttyUSB0
 ROBOTIS=(DynamixelSDK dynamixel_interfaces dynamixel_hardware_interface open_manipulator)   # as in docker/Dockerfile
 APT_ALWAYS=(curl git python3-colcon-common-extensions ros-humble-rosbridge-suite)
 USB_RULE=/etc/udev/rules.d/99-open-manipulator-cdc.rules
-APT_ROBOTIS=(libboost-all-dev ros-humble-gazebo-ros-pkgs ros-humble-gazebo-ros2-control ros-humble-ros2-control
-             ros-humble-ros2-controllers ros-humble-gripper-controllers ros-humble-moveit ros-humble-xacro)
+APT_ROBOTIS=(ros-humble-ros2-control ros-humble-ros2-controllers ros-humble-gripper-controllers ros-humble-xacro
+             ros-humble-robot-state-publisher ros-humble-rosidl-default-generators)
+# of the 12 ROBOTIS packages, the 5 the arm's driver needs: the rest (MoveIt config, GUI, teleop) wants MoveIt and Gazebo
+OMX_BUILD=(open_manipulator_x_bringup dynamixel_hardware_interface)
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -65,7 +67,7 @@ cmd_setup() {
         for r in "${ROBOTIS[@]}"; do
             [ -d "$HOME/omx_ws/src/$r" ] || git clone --depth 1 -b humble "https://github.com/ROBOTIS-GIT/$r.git" "$HOME/omx_ws/src/$r"
         done
-        (cd "$HOME/omx_ws" && colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release)
+        (cd "$HOME/omx_ws" && colcon build --packages-up-to "${OMX_BUILD[@]}" --cmake-args -DCMAKE_BUILD_TYPE=Release)
         source_ros
     else
         echo "== ROBOTIS packages: found in $w"

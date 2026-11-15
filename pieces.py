@@ -1,4 +1,4 @@
-"""Detect cylindrical pieces (red / blue / green / white, 35 mm diameter, 30 mm tall) by colour + known size.
+"""Detect cylindrical pieces (red / blue / green, 35 mm diameter, 30 mm tall) by colour + known size.
 
 Calibrated mode (--calib): the camera image is remapped to a top-down view of the plane at piece-top
 height, where every top face is an exact circle of known pixel radius. Candidates (fixed-radius Hough +
@@ -26,9 +26,8 @@ COLORS = {
     "red": {"h": [(0, 10), (170, 180)], "s": (100, 255), "v": (40, 255)},
     "blue": {"h": [(100, 135)], "s": (100, 255), "v": (20, 255)},
     "green": {"h": [(40, 90)], "s": (50, 255), "v": (40, 255)},
-    "white": {"h": [(0, 180)], "s": (0, 45), "v": (150, 255), "min_rim": 0.75},  # white table: demand a clear rim
 }
-DRAW = {"red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0), "white": (255, 255, 255)}
+DRAW = {"red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0)}
 
 
 @dataclass
@@ -168,7 +167,7 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
             k = int(s.argmax())
             x, y = xs[k], ys[k]
         name = names[ci[k]]
-        if s[k] > 0 and rim[k] >= colors[name].get("min_rim", min_rim):
+        if s[k] > 0:
             results.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(br[k])))
 
     # Non-max suppression: touching pieces are 2r apart, duplicates (e.g. on a piece's side) are closer.

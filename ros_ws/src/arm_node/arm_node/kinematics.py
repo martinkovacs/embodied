@@ -183,13 +183,19 @@ def wake_path(q_now, q_to=HOME, step=0.1):
     raise ValueError(f"no way up from here without going lower first: {LIFT_RECOVERY}")
 
 
+def travel_moves(q, q_to, table_z=0.0, op_xy=None):
+    """The trajectories [[q]] of a travel move from q to q_to: a low arm (a stop mid-descent, a hand move) first
+    lifts straight up, then the checked move. ValueError before anything moves if either can't be done."""
+    lift = [] if fk(q)[2] >= table_z + CLEAR else lift_path(q, table_z, op_xy)     # fails closed on nan
+    check_travel(lift[-1] if lift else q, q_to, table_z)
+    return [lift, [q_to]] if lift else [[q_to]]
+
+
 def wake_moves(q, table_z=0.0, op_xy=None):
     """The trajectories [[q]] of a wake from q: home's own way up when it has one (straight up, so nothing next
     to the arm is swept aside), otherwise wake_path()."""
     try:
-        lift = [] if fk(q)[2] >= table_z + CLEAR else lift_path(q, table_z, op_xy)
-        check_travel(lift[-1] if lift else q, HOME, table_z)
-        return [lift, [HOME]] if lift else [[HOME]]
+        return travel_moves(q, HOME, table_z, op_xy)
     except ValueError:
         return [wake_path(q)]
 

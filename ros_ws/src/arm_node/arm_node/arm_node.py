@@ -37,8 +37,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from arm_node.kinematics import (CLEAR, GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, check_travel, fk, lift_path,
-                                 vertical, wake_moves)
+from arm_node.kinematics import GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, travel_moves, vertical, wake_moves
 
 JOINTS = ["joint1", "joint2", "joint3", "joint4"]
 OPEN, CLOSED = 0.019, -0.01     # gripper_left_joint limits, m; closing on a piece just stalls on it
@@ -249,8 +248,7 @@ class ArmNode(Node):
                 # shortcut: likely never triggers: the controller's default goal_tolerance (10 mm) ends the close
                 # as soon as the jaws pass 0, so the position here is far from CLOSED either way. The runner's
                 # camera check catches a miss. Check the reported position on the real arm before relying on it.
-                pos = getattr(res.result, "position", None)     # absent (fake hardware): skip the check
-                if not air and pos is not None and pos <= CLOSED + EMPTY_MARGIN:   # jaws at the limit: nothing there
+                if not air and res.result.position <= CLOSED + EMPTY_MARGIN:   # jaws at the limit: nothing there
                     await self.move(ascent)                     # clear the piece level before failing
                     raise RuntimeError("gripper closed on nothing: missed the piece")
             else:
@@ -262,20 +260,8 @@ class ArmNode(Node):
 
     async def travel(self, q, table_z):
         """Travel move with a clearance check, lifting straight up first when the arm already sits low."""
-        q_from = self.joints()
-        z = fk(q_from)[2]
-        if not (z >= table_z + CLEAR):          # fail closed on nan; a low arm (stop mid-descent or hand move)
-            try:                                # first lifts, from the interrupted op's spot or its own column
-                lift = lift_path(q_from, table_z, self.op_xy)
-            except ValueError as e:
-                raise RuntimeError(str(e)) from None
-            await self.move(lift)               # one multi-point straight-up trajectory, not path-checked
-            q_from = lift[-1]
-        try:
-            check_travel(q_from, q, table_z)
-        except ValueError as e:
-            raise RuntimeError(str(e))
-        await self.move([q])
+        for points in travel_moves(self.joints(), q, table_z, self.op_xy):
+            await self.move(points)
 
     async def move(self, points):
         """One multi-point trajectory from where the arm is (per /joint_states) through points."""

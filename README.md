@@ -1,6 +1,6 @@
 # embodied — robot trust experiment
 
-A robot arm (OpenMANIPULATOR-X, ROS 2 Humble) sorts coloured pieces (Ø35 × 30 mm; red, blue, green, white)
+A robot arm (OpenMANIPULATOR-X, ROS 2 Humble) sorts coloured pieces (Ø35 × 30 mm; red, blue, green)
 into colour zones. Per trial a script makes it do the task correctly, make a mistake, or hold the piece up and
 ask the participant (*"Is this red?"*). Everything is logged for the trust analysis.
 
@@ -79,7 +79,7 @@ images in `synthetic/` and are tracked as the arm moves them, because nothing re
 synthetic images; `--vision cameras` always uses `layouts/lab.yaml`.
 
 **The robot's voice** comes from the WAVs in `audio/` (`ask_red.wav`, `ask_blue.wav`, `ask_green.wav`,
-`ask_white.wav`, `which.wav`, `done.wav`), played with `pw-play` / `paplay` / `aplay` / `afplay`. They were generated
+`which.wav`, `done.wav`), played with `pw-play` / `paplay` / `aplay` / `afplay`. They were generated
 with [magpie-tts.cpp](https://github.com/mudler/magpie-tts.cpp) at commit `3008ff7` and NVIDIA's Magpie TTS
 Multilingual 357M (`magpie-tts-multilingual-357m-q8_0.gguf`, `--lang en --speaker Aria --seed 42`), then trimmed at
 -45 dBFS, faded and peak-normalized to -3 dBFS. If a WAV is missing, macOS `say` stands in; elsewhere the panel shows
@@ -119,7 +119,7 @@ docker exec -d -e DISPLAY=:1 robot-arm bash -c 'source /opt/ros/humble/setup.bas
 - `participants.csv`: each participant's conditions in running order (`--block 2` = their second one).
 - `scenarios/<condition>.yaml`: the slot order (the same in every condition) and which trials are `mistake`
   (with `put_to`) or `ask`. Unlisted trials are `correct`. **The trial numbers in there are placeholders.**
-- `scenarios/smoke.yaml` is four pieces for a first test and isn't part of the experiment.
+- `scenarios/smoke.yaml` is three pieces for a first test and isn't part of the experiment.
 - `layouts/synthetic.yaml` (`--vision synthetic`) and `layouts/lab.yaml` (`--vision cameras`, written by
   `lab_layout.py`): piece slots and zone spots in table mm, plus the robot frame file. On start the runner checks that the arm reaches every slot and spot.
 - `layouts/*.yaml`: on start the runner also checks that the arm travels between every slot, spot, home and
@@ -170,7 +170,7 @@ If the link to rosbridge drops, STOP can't reach the arm: the panel says so in r
 3. **Table pose.** In the same GUI: lay the checkerboard flat on the table and capture the table pose. This
    defines the table frame every position is measured in. Once that's done, don't move the cameras or the table.
 4. **Colours.** Check the detection tab under the lab lights. Tune the HSV ranges in `pieces.py` if a colour
-   is missed. White pieces need a dark mat under them.
+   is missed.
 5. **Table → robot.** `./lab.sh python robot_frame.py`: close the gripper and touch the
    fingertips to 4-6 known table points spread over the work area (torque off, move by hand). Then
    `--check` on new points: accept if every error is < 5 mm. Redo after re-capturing the table pose. Each

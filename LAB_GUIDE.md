@@ -105,8 +105,8 @@ A window opens.
 ./lab.sh python lab_layout.py --view --condition smoke
 ```
 
-The arm must be up before the pieces go on the table. Put one piece on each of the 4 thick circles (r1, w1, g1, b1). The circle gets thicker when the camera sees the
-right colour there. White pieces need a dark mat under them. Press **q** when all 4 are thick.
+The arm must be up before the pieces go on the table. Put one piece on each of the 3 thick circles (r1, g1, b1). The circle gets thicker when the camera sees the
+right colour there. Press **q** when all 3 are thick.
 
 If some circles are off the table, add `--bounds XMIN XMAX YMIN YMAX` (table mm) to the first command.
 
@@ -134,7 +134,7 @@ different, the (0, 0) corner in step 5 was the wrong one: redo step 5.
 ```
 
 Open <http://localhost:8081> and press **Start**. The arm does everything slowly and high up, without touching a
-piece. The red **STOP** button halts it. Close it with Ctrl-C when it says done.
+piece. `--no-speech` means no microphone: if the robot asks something, click the answer on the panel. The red **STOP** button halts it. Close it with Ctrl-C when it says done.
 
 ## 10. The real thing
 
@@ -144,7 +144,7 @@ The same command without `--air`:
 ./lab.sh python runner.py --participant TEST --vision cameras --no-speech
 ```
 
-Four pieces sorted into their zones means **the robot works**.
+Three pieces sorted into their zones means **the robot works**.
 
 ## Every later session
 
@@ -155,18 +155,36 @@ still running.
 2. Start it. The arm rises by itself; if it doesn't, the reason is printed.
 
 ```bash
-./lab.sh run P07
+./lab.sh run P07 --no-speech
 ```
 
 3. When it says `Arm is up`, lay out the pieces, open <http://localhost:8081> and press **Start**.
-4. At the end: hold the arm, then Ctrl-C.
+4. When the robot asks something, the panel shows the buttons **yes**, **no**, **red**, **blue**, **green**:
+   click what the participant answers. The robot still says its question out loud.
+5. At the end: hold the arm, then Ctrl-C.
 
-Options of `runner.py` go after the participant, for example `./lab.sh run TEST --no-speech --air`.
+`--no-speech` means the answers are clicked on the panel, and no microphone is needed. Leave it out
+(`./lab.sh run P07`) to have the participant's spoken answers recognised; the buttons work then too.
+Other options of `runner.py` go in the same place, for example `./lab.sh run TEST --no-speech --air`.
+
+## What a healthy start prints
+
+`./lab.sh arm` prints these lines, in this order (`./lab.sh run` writes them to `logs/arm_side_*.log`).
+The first one that is missing shows where the start broke:
+
+1. `Succeeded to open the port!` and `Succeeded to change the [1000000] baudrate!`: the USB adapter answers.
+2. `[ID:011] Request ping - Ping succeeded. Dynamixel model number : 1020`, once for each of 011 to 015:
+   every motor answers. A missing ID is that motor: its cable, its ID or its baud rate.
+3. `[ID:011] Torque ON`, again for 011 to 015, then `Dynamixel Hardware Start!`
+4. `Configured and activated` for `joint_state_broadcaster`, `arm_controller` and `gripper_controller`.
+
+`No real-time kernel detected` is a normal warning.
 
 ## If something goes wrong
 
 | What you see | What to do |
 |---|---|
+| A motor's `Ping succeeded` line is missing, or the motors answer but a joint or the gripper doesn't move | The settings stored in the motors: the start doesn't repair them. Stop `./lab.sh arm` and check with ROBOTIS' DYNAMIXEL Wizard 2.0: IDs 11 to 14 (joints) and 15 (gripper), all at 1 Mbps, joints in *Position Control Mode*, gripper in *Current based Position Control Mode*. Old firmware is updated there too |
 | `/dev/ttyUSB0 doesn't exist` | Check the arm's USB cable and power |
 | `no permission on /dev/ttyUSB0` | `./lab.sh usb` (installs the USB rule, asks for the sudo password) |
 | The arm is jerky, or the controllers don't start | `cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer` must print `1`. If not: `./lab.sh usb` |

@@ -53,7 +53,7 @@ from arm_node.kinematics import GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, check_travel
 from stereo_calib import StereoCalib
 
 ROOT = Path(__file__).resolve().parent
-COLORS = ("red", "blue", "green", "white")
+COLORS = ("red", "blue", "green")
 BEHAVIORS = ("correct", "mistake", "ask")
 MATCH_MM = 20.0                 # a detection this close to a slot / spot is the piece there (pieces are 35 mm)
 SPACING_MM = 40.0               # zone spots at least this far from every other spot and slot (centre to centre)
@@ -1058,7 +1058,7 @@ def self_test():
         ev = events(r)
         assert r.log.path.name.endswith("_smoke_air.jsonl") and not last(ev, "unplanned") and not [
             e for e in last(ev, "vision") if e is None]
-        assert [e["placed"] for e in last(ev, "trial_end")] == ["red", "white", "green", "blue"]
+        assert [e["placed"] for e in last(ev, "trial_end")] == ["red", "green", "blue"]
         assert all(e["air"] and e["correct"] for e in last(ev, "trial_end"))
 
         # "no" to a question: the robot asks which colour and puts it there
@@ -1155,7 +1155,7 @@ def self_test():
             raise AssertionError("put_to on a correct trial passed")
         except AssertionError as e:
             assert "put_to only goes with behavior: mistake" in str(e), e
-        rejects(lambda b: b["zones"].update(blue=b["zones"]["blue"][:4]), "blue zone: 4 spots, the script can need 5")
+        rejects(lambda b: b["zones"].update(blue=b["zones"]["blue"][:4]), "blue zone: 4 spots, the script can need 7")
         x, y = lay["zones"]["green"][0]
         rejects(lambda b: b["zones"]["green"].insert(1, [x, y + 30]), f"green spot 1 ({x:.0f}, {y:.0f}) is 30 mm from green spot 2")
         global HOME
@@ -1235,7 +1235,7 @@ def self_test():
         assert [e["data"].get("verify_only") for e in first if e["event"] == "trial_start"] == [None, True]
         assert sum(e["event"] == "arm_cmd" and e["data"]["op"] == "pick" for e in first) == 1
         assert last(ev, "trial_end")[0] == {"placed": "red", "correct": True}
-        assert [e["data"]["index"] for e in ev if e["event"] == "spot" and e["data"]["zone"] == "red"] == [0, 1, 2, 3, 4]
+        assert [e["data"]["index"] for e in ev if e["event"] == "spot" and e["data"]["zone"] == "red"] == [0, 1, 2, 3]
 
         # the runner quits mid-session (STOP, then the process ends): the next start resumes where it stopped
         r = Runner(f"T{len(os.listdir(tmp))}", "correct", StopsOnThirdPlace(), world, tmp, auto=put_back, audio=False)
