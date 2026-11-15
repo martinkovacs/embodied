@@ -771,7 +771,7 @@
    ]
   },
   {
-   "color": "red",
+   "color": "green",
    "center_table_world_mm": [
     67.417,
     24.071,
@@ -819,7 +819,7 @@
    ]
   },
   {
-   "color": "white",
+   "color": "blue",
    "center_table_world_mm": [
     70.94,
     -27.509,
@@ -915,7 +915,7 @@
    ]
   },
   {
-   "color": "white",
+   "color": "blue",
    "center_table_world_mm": [
     -42.711,
     -7.409,
@@ -963,7 +963,7 @@
    ]
   },
   {
-   "color": "white",
+   "color": "blue",
    "center_table_world_mm": [
     -29.588,
     72.032,

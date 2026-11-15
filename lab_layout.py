@@ -1,8 +1,9 @@
 """Writes layouts/lab.yaml: where the pieces start and where they go, on the real table, and shows it on the cameras.
 
 Run it after calib_gui.py and robot_frame.py. Every position is one the arm reaches, at least 40 mm from the others
-and seen by both cameras. Slots get the middle of the arm's sweep, the colour zones the sides. The result goes
-through the same check as a session start (runner.check_scenario), for every scenario asked for.
+and seen by both cameras. The program picks the places itself: the pieces' slots in the middle of the arm's sweep,
+red and green on one side, blue on the other, with an empty strip between the groups so each one reads as a
+group of its own. The result goes through the same check as a session start (runner.check_scenario), for every scenario asked for.
 
 --view shows both cameras with the layout drawn on them: put each piece on its circle. A circle turns thick once
 the cameras see the right colour there. Press q to quit.
@@ -35,9 +36,10 @@ GRID_MM = 42.0                  # the check wants 40: a little over, so a rounde
 R_RANGE = (max(R_MIN, 100.0), 205.0)    # from the arm's axis; the range kinematics.py's self-test proves works
 IMAGE_MARGIN_PX = 30            # a piece this close to the image edge is easily cut off
 PIECE_R_MM = pieces.PIECE_D_MM / 2
+GROUP_GAP_MM = 60.0             # between two groups: over one grid step, so a row of positions stays empty between them
 SHIFTS = 6                      # grid offsets tried along each axis: the best fills the ring
-PREFIX = {"r": "red", "w": "white", "g": "green", "b": "blue"}
-BGR = {"red": (60, 60, 230), "blue": (230, 120, 40), "green": (80, 200, 80), "white": (245, 245, 245)}
+PREFIX = {"r": "red", "g": "green", "b": "blue"}
+BGR = {"red": (60, 60, 230), "blue": (230, 120, 40), "green": (80, 200, 80)}
 OUT = runner.ROOT / runner.LAB_LAYOUT
 ALL_CONDITIONS = sorted(p.stem for p in (runner.ROOT / "scenarios").glob("*.yaml"))
 
@@ -123,15 +125,28 @@ def build(calib, T, conditions, frame_name, bounds=None):
                  "--conditions smoke correct.")
     mid = atan2(np.mean([y - by for _, y in cands]), np.mean([x - bx for x, _ in cands]))
     off = {p: (atan2(p[1] - by, p[0] - bx) - mid + pi) % (2 * pi) - pi for p in cands}   # angle from the middle
-    chosen = sorted(sorted(cands, key=lambda p: abs(off[p]))[:total], key=lambda p: off[p])
+    by_angle = sorted(cands, key=off.get)
+    sizes = [need["red"], need["green"], len(slot_ids), need["blue"]]    # the groups, in their order along the sweep
 
-    def take(n):
-        taken, chosen[:n] = chosen[:n], []
-        return [[round(float(x), 1), round(float(y), 1)] for x, y in taken]
-    zones = {"red": take(need["red"]), "green": take(need["green"])}
-    slots = {s: [PREFIX[s[0]], *xy] for s, xy in zip(slot_ids, take(len(slot_ids)))}
-    zones |= {"blue": take(need["blue"]), "white": take(need["white"])}
-    return {"robot_frame": frame_name, "slots": slots, "zones": {c: zones[c] for c in runner.COLORS}}
+    def groups(start):
+        """The groups taken one after the other from by_angle[start:], each followed by an empty strip; None if
+        they don't fit."""
+        out, left = [], by_angle[start:]
+        for n in sizes:
+            if len(left) < n:
+                return None
+            out.append(left[:n])
+            left = [p for p in left[n:] if all(hypot(p[0] - x, p[1] - y) >= GROUP_GAP_MM for x, y in out[-1])]
+        return out
+    fits = [g for g in map(groups, range(len(by_angle))) if g]
+    if not fits:
+        sys.exit(f"Room for {len(cands)} positions: enough for the {total} that {', '.join(conditions)} need, but not "
+                 f"with {GROUP_GAP_MM:.0f} mm between the groups.\nRaise or angle the cameras so they see more around "
+                 "the arm, or for now ask for less, e.g. --conditions smoke correct.")
+    red, green, slot_xy, blue = ([[round(float(x), 1), round(float(y), 1)] for x, y in g]     # slots mid-sweep
+                                 for g in min(fits, key=lambda g: abs(sum(off[p] for p in g[2]))))
+    slots = {s: [PREFIX[s[0]], *xy] for s, xy in zip(slot_ids, slot_xy)}
+    return {"robot_frame": frame_name, "slots": slots, "zones": {"red": red, "blue": blue, "green": green}}
 
 
 def checked(lay, T, conditions):
@@ -210,7 +225,11 @@ def self_test():
     conditions = ["smoke", "correct"]
     lay = build(calib, T, conditions, "synthetic/robot_frame.json")
     checked(lay, T, conditions)
-    assert set(lay["slots"]) == {"r1", "r2", "r3", "r4", "r5", "w1", "w2", "w3", "g1", "g2", "g3", "b1"}, lay["slots"]
+    assert set(lay["slots"]) == {f"{c}{i}" for c in "rgb" for i in range(1, 5)}, lay["slots"]
+    sets = [[s[1:] for s in lay["slots"].values()], *lay["zones"].values()]    # the four groups stand apart
+    for i, a in enumerate(sets):
+        for b in sets[i + 1:]:
+            assert min(hypot(p[0] - q[0], p[1] - q[1]) for p in a for q in b) >= GROUP_GAP_MM - 0.2, (a, b)
     assert all(lay["slots"][s][0] == PREFIX[s[0]] for s in lay["slots"])
     with tempfile.TemporaryDirectory() as tmp:
         write(lay, Path(tmp) / "x.yaml")

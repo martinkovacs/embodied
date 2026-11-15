@@ -63,7 +63,7 @@ LEVEL_FALL_DB_S = 40.0      # the meter falls this fast, so peaks stick a bit
 ONSET_BACK_THR, ONSET_BACK_FRAMES = 0.15, 8  # onset walks back: contiguous frames >= thr, at most 8
 NEG_SCOPE = 4               # a hit stops counting when one of these sits NEG_SCOPE tokens before it
 LANGUAGES = ("en", "hu")    # both warm up; the language is switched any time
-COLORS = ("red", "blue", "green", "white")
+COLORS = ("red", "blue", "green")
 
 WORDS = {   # answers -> words / phrases per language; multi-word = consecutive whole words. Only unambiguous
             # ones here: "right"/"ja"/"aha" and the like answer themselves ("Right, it's blue").
@@ -71,11 +71,11 @@ WORDS = {   # answers -> words / phrases per language; multi-word = consecutive 
                    "that is right", "that s right"],
            "no": ["no", "nope", "nah", "wrong", "incorrect", "false", "is not",
                   "not right", "not correct", "not true", "not it"],
-           "red": ["red"], "blue": ["blue"], "green": ["green"], "white": ["white"]},
+           "red": ["red"], "blue": ["blue"], "green": ["green"]},
     "hu": {"yes": ["igen", "persze", "igaz", "helyes", "így van", "igy van"],
            "no": ["nem", "dehogy", "rossz", "hamis", "nem az"],
            "red": ["piros", "vörös", "voros"], "blue": ["kék", "kek"],
-           "green": ["zöld", "zold"], "white": ["fehér", "feher"]},
+           "green": ["zöld", "zold"]},
 }
 NEGATORS = frozenset(("not", "never", "nem", "dehogy"))
 UNCERTAIN = ("don t know", "do not know", "not sure", "no idea", "maybe", "perhaps", "talán", "talan",
@@ -788,14 +788,14 @@ def self_test():
     assert m("it's not right", y_n, "en") == "no"            # negated before a yes-word
     assert m("yes no", y_n, "en") is None and m("red or blue", ("red", "blue"), "en") is None
     assert m("please", colours, "en") is None and m("red", colours, "en") == "red"
-    assert m("white.", colours, "en") == "white"
+    assert m("green.", colours, "en") == "green"
     # ambiguous yes-words are gone: "right" alone, "it is", jó/jo/ja, aha, yah
     assert m("Right, it's blue", y_n, "en") is None and m("it is blue", y_n, "en") is None
     assert m("Jó", y_n, "hu") is None and m("ja", y_n, "hu") is None and m("Aha.", y_n, "hu") is None
     # a hit with a negator up to 4 tokens back in the clause doesn't count as itself; yes-word -> no
     assert m("I don't think that's right", y_n, "en") == "no"
     assert m("I don't think it's red", colours, "en") is None and m("not really red", colours, "en") is None
-    assert m("it isn't blue", colours, "en") is None and m("not white", colours, "en") is None
+    assert m("it isn't blue", colours, "en") is None and m("not green", colours, "en") is None
     assert m("No, not red, it's blue", colours, "en") == "blue"
     assert m("nem piros, kék", colours, "hu") == "blue" and m("nem is piros", colours, "hu") is None
     assert m("Nem igaz", y_n, "hu") == "no" and m("it isn't", y_n, "en") == "no"
@@ -826,7 +826,7 @@ def self_test():
     assert m("Biztos nem", y_n, "hu") is None  # not via UNCERTAIN ("nem biztos"): no "nem"-answer here
     assert m("Nem, nem piros, kék", colours, "hu") == "blue"    # a colour question: negated colours are no hits
     for opt, said in (("blue", "kék"), ("blue", "kek"), ("green", "zöld"), ("green", "zold"),
-                      ("white", "fehér"), ("white", "feher"), ("red", "piros"), ("red", "voros")):
+                      ("red", "piros"), ("red", "voros")):
         assert m(said, (opt,) + colours, "hu") == opt, said
     assert m("igen, nem", y_n, "hu") is None
 

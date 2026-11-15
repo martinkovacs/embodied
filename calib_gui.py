@@ -38,7 +38,7 @@ from cameras import BASLER, DATA, SETTINGS_PATH, STAGES, TEST_DATA, TEST_FILES, 
 PREVIEW_W = 640
 PORT = 8080
 BROWSERS = ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "brave", "microsoft-edge-stable")
-HEX = {"red": "#e53935", "blue": "#1e40af", "green": "#2e9d4f", "white": "#f5f5f5"}
+HEX = {"red": "#e53935", "blue": "#1e40af", "green": "#2e9d4f"}
 
 
 @dataclass

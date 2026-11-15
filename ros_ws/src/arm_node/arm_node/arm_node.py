@@ -2,9 +2,11 @@
 
 /arm/cmd     std_msgs/String JSON  {"id": 7, "op": "pick", "x": 120, "y": -40}   x, y: robot base frame (link1), mm
               z: table surface height at (x, y), mm, required for pick/place (GRASP_Z etc. are heights above it)
-             op: pick | place | hover (x, y, z) | show | home | open | stop
+             op: pick | place | hover (x, y, z) | show | home | open | stop | wake
              air: true (optional) makes a dry run of the command: slow, pick / place stop AIR_MM above the piece
              hover: the fingertips go to the approach height over (x, y), always slowly, and stay there
+             wake: slowly up to home from wherever the arm lies, never lower than it is: straight up like a home
+                   when that works, otherwise joint by joint, which can sweep sideways (startup, clear table)
 /arm/status  std_msgs/String JSON  {"id": 7, "state": "started" | "done" | "failed", "reason": "..."}
 
 One command at a time: another one arriving meanwhile fails with "busy". stop cancels the running motion and
@@ -35,8 +37,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from arm_node.kinematics import (CLEAR, GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, check_travel, fk, lift_path,
-                                 vertical)
+from arm_node.kinematics import GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, travel_moves, vertical, wake_moves
 
 JOINTS = ["joint1", "joint2", "joint3", "joint4"]
 OPEN, CLOSED = 0.019, -0.01     # gripper_left_joint limits, m; closing on a piece just stalls on it
@@ -49,6 +50,7 @@ GOAL_ACCEPT_S = 5.0             # a live controller answers this fast
 CANCEL_ACK_S = 2.0              # stop: how long the controller may take to answer its cancel request
 RESULT_EXTRA_S = 5.0            # arm goal result: trajectory duration + this
 GRIP_RESULT_S = 5.0             # gripper goal result
+ARRIVE_RAD = 0.15               # a finished move must have brought every joint this close to its target
 JOINT_STALE_S = 1.0             # /joint_states: without a reading fresher than this, nothing may move
 
 
@@ -210,9 +212,12 @@ class ArmNode(Node):
 
     async def run(self, cmd):
         op, air = cmd["op"], bool(cmd.get("air"))
-        self.speed = AIR_SPEED if air or op == "hover" else MAX_SPEED
+        self.speed = AIR_SPEED if air or op in ("hover", "wake") else MAX_SPEED
         if op == "home":
             await self.travel(HOME, self.table_z)
+        elif op == "wake":
+            for points in wake_moves(self.joints(), self.table_z, self.op_xy):
+                await self.move(points)
         elif op == "show":
             await self.travel(SHOW, self.table_z)
         elif op == "open":
@@ -240,8 +245,10 @@ class ArmNode(Node):
             await self.move(descent)
             if op == "pick":
                 res = await self.grip(CLOSED)
-                pos = getattr(res.result, "position", None)     # absent (fake hardware): skip the check
-                if not air and pos is not None and pos <= CLOSED + EMPTY_MARGIN:   # jaws at the limit: nothing there
+                # shortcut: likely never triggers: the controller's default goal_tolerance (10 mm) ends the close
+                # as soon as the jaws pass 0, so the position here is far from CLOSED either way. The runner's
+                # camera check catches a miss. Check the reported position on the real arm before relying on it.
+                if not air and res.result.position <= CLOSED + EMPTY_MARGIN:   # jaws at the limit: nothing there
                     await self.move(ascent)                     # clear the piece level before failing
                     raise RuntimeError("gripper closed on nothing: missed the piece")
             else:
@@ -253,20 +260,8 @@ class ArmNode(Node):
 
     async def travel(self, q, table_z):
         """Travel move with a clearance check, lifting straight up first when the arm already sits low."""
-        q_from = self.joints()
-        z = fk(q_from)[2]
-        if not (z >= table_z + CLEAR):          # fail closed on nan; a low arm (stop mid-descent or hand move)
-            try:                                # first lifts, from the interrupted op's spot or its own column
-                lift = lift_path(q_from, table_z, self.op_xy)
-            except ValueError as e:
-                raise RuntimeError(str(e)) from None
-            await self.move(lift)               # one multi-point straight-up trajectory, not path-checked
-            q_from = lift[-1]
-        try:
-            check_travel(q_from, q, table_z)
-        except ValueError as e:
-            raise RuntimeError(str(e))
-        await self.move([q])
+        for points in travel_moves(self.joints(), q, table_z, self.op_xy):
+            await self.move(points)
 
     async def move(self, points):
         """One multi-point trajectory from where the arm is (per /joint_states) through points."""
@@ -277,6 +272,12 @@ class ArmNode(Node):
         res = await self.send(self.arm, goal, total + RESULT_EXTRA_S, "arm goal")
         if res.status != GoalStatus.STATUS_SUCCEEDED:
             raise RuntimeError(f"arm controller: status {res.status} {res.result.error_string}")
+        # the ROBOTIS controller runs open loop: it reports success on time alone, also for motors that never moved
+        q = self.joints()
+        if max(abs(a - b) for a, b in zip(q, points[-1])) > ARRIVE_RAD:
+            raise RuntimeError(f"the arm did not get there: joints {[round(v, 2) for v in q]}, target "
+                               f"{[round(v, 2) for v in points[-1]]}. A blinking motor LED means overload: "
+                               "switch the arm's power off and on, then restart ./lab.sh arm")
 
     async def grip(self, position):
         goal = GripperCommand.Goal()

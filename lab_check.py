@@ -58,7 +58,7 @@ def check_port():
     if not os.path.exists(PORT):
         raise Fail(f"{PORT} doesn't exist: plug in and power the arm's USB adapter")
     if not os.access(PORT, os.R_OK | os.W_OK):
-        raise Fail(f"no permission: sudo chmod 666 {PORT}")
+        raise Fail(f"no permission on {PORT}: ./lab.sh usb")
 
 
 def connect(host):
@@ -99,8 +99,8 @@ def check_pose(arm):
     z = fk(q)[2]
     table_z = float(robot_frame.load(FRAME_PATH)[2, 3]) if FRAME_PATH.exists() else 0.0
     if not z >= table_z + CLEAR:
-        raise Warn(f"fingertips are {z - table_z:.0f} mm over the table: `home` may refuse. Stop ./lab.sh arm, lift the "
-                   "arm by hand, start it again")
+        raise Warn(f"fingertips are {z - table_z:.0f} mm over the table: `home` may refuse. Clear the table around "
+                   "the arm, then ./lab.sh cmd '{\"op\": \"wake\"}'")
     return f"fingertips {z - table_z:.0f} mm over the table"
 
 

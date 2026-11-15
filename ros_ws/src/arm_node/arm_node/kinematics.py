@@ -84,8 +84,7 @@ def vertical(x, y, z_from, z_to, step=5.0):
     return out
 
 
-LIFT_RECOVERY = ("turn the torque off, move the arm up by hand, then restart the bringup (robot_frame.py's "
-                 "docstring)")
+LIFT_RECOVERY = "hold the arm, ./lab.sh torque-off, move it up by hand, then restart ./lab.sh arm"
 
 
 def lift_path(q_now, table_z, op_xy=None):
@@ -95,7 +94,7 @@ def lift_path(q_now, table_z, op_xy=None):
     naming the pose and the hand-lift procedure when no command can do the lift (a home does the same lift)."""
     x, y, z = fk(q_now)
     msg = (f"arm at ({x:.0f}, {y:.0f}, {z:.0f}) mm over the table cannot be lifted by a command (a home does "
-           f"the same lift): {LIFT_RECOVERY}")
+           f"the same lift): clear the table around the arm, then send wake")
     try:
         px, py = (op_xy if op_xy is not None and hypot(x - op_xy[0], y - op_xy[1]) <= 10.0 else (x, y))
         z0 = max(z, table_z + GRASP_Z)
@@ -106,6 +105,99 @@ def lift_path(q_now, table_z, op_xy=None):
     if not (path_min_z(q_now, first) > z - 2.0):        # fail closed: the straight line may dig into the table
         raise ValueError(msg)
     return pts
+
+
+def heights(q):
+    """z of the elbow (joint3), the wrist (joint4) and the fingertips."""
+    _, q2, q3, q4 = q
+    elbow = J2_Z - UP_X * sin(q2) + UP_Z * cos(q2)
+    wrist = elbow - FOREARM * sin(q2 + q3)
+    return elbow, wrist, wrist - TOOL * sin(q2 + q3 + q4)
+
+
+def _seg_gap(a, b, c, d):
+    """Distance between the 2D segments a-b and c-d (0 when they cross)."""
+    def side(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    def to_seg(p, q, r):    # point p to segment q-r
+        vx, vy = r[0] - q[0], r[1] - q[1]
+        t = max(0.0, min(1.0, ((p[0] - q[0]) * vx + (p[1] - q[1]) * vy) / (vx * vx + vy * vy)))
+        return hypot(p[0] - q[0] - t * vx, p[1] - q[1] - t * vy)
+
+    if side(a, b, c) * side(a, b, d) < 0 and side(c, d, a) * side(c, d, b) < 0:
+        return 0.0
+    return min(to_seg(a, c, d), to_seg(b, c, d), to_seg(c, a, b), to_seg(d, a, b))
+
+
+def self_gap(q):
+    """Smallest centre-line distance between arm parts that can meet, in the arm's own vertical plane: the
+    gripper against the upper arm and the base column, and the forearm against the base column."""
+    _, q2, q3, q4 = q
+    base, j2 = (0.0, 0.0), (0.0, J2_Z)
+    j3 = (UP_X * cos(q2) + UP_Z * sin(q2), J2_Z - UP_X * sin(q2) + UP_Z * cos(q2))
+    j4 = (j3[0] + FOREARM * cos(q2 + q3), j3[1] - FOREARM * sin(q2 + q3))
+    tip = (j4[0] + TOOL * cos(q2 + q3 + q4), j4[1] - TOOL * sin(q2 + q3 + q4))
+    return min(_seg_gap(j4, tip, j2, j3), _seg_gap(j4, tip, base, j2), _seg_gap(j3, j4, base, j2))
+
+
+SELF_CLEAR = 45.0               # centre lines this far apart = parts not touching (links ~35-40 mm thick). Measure.
+
+
+def wake_path(q_now, q_to=HOME, step=0.1):
+    """Waypoints [q] from wherever the arm lies (resting on the table, folded, moved by hand) up to q_to, along
+    which the elbow, wrist and fingertips never go more than 2 mm lower than the lowest of them is now (or, for
+    an arm already above q_to, than the lowest of them at q_to): whatever the arm rests on, it only moves away
+    from it. The arm doesn't pass through itself either: self_gap() stays above SELF_CLEAR, or above what it is
+    now for an arm that starts folded tighter. Breadth-first over joint2..4 in `step` rad moves until the
+    straight joint-space line to q_to is clear; joint1 only turns on that last line. ValueError if there is none.
+    shortcut: knows nothing about pieces or anything else standing around the arm, so it is for starting up
+    with a clear table, not for use between trials."""
+    floor = min(*heights(q_now), *heights(q_to)) - 2.0
+    gap = min(SELF_CLEAR, self_gap(q_now)) - 1.0
+
+    def clear(a, b, n):
+        qs = (tuple(m + (w - m) * i / n for m, w in zip(a, b)) for i in range(1, n + 1))
+        return all(min(heights(q)) >= floor and self_gap(q) >= gap for q in qs)
+
+    start, q_to = tuple(q_now), tuple(q_to)
+    # also catches nan. 0.05 rad of slack: a limp arm resting on a mechanical stop reads just past the URDF limit
+    if not all(lo - 0.05 <= v <= hi + 0.05 for v, (lo, hi) in zip(start, LIMITS)):
+        raise ValueError(f"joints {[round(v, 2) for v in start]} are outside their limits: {LIFT_RECOVERY}")
+    came, queue = {(0, 0, 0): None}, [(0, 0, 0)]
+    at = lambda k: (start[0], *(start[j + 1] + k[j] * step for j in range(3)))
+    for k in queue:                             # appended to while iterating: breadth-first
+        if clear(at(k), q_to, 40):
+            pts = [q_to]
+            while came[k] is not None:
+                pts.insert(0, at(k))
+                k = came[k]
+            return pts
+        for j in range(3):
+            for d in (-1, 1):
+                n = tuple(v + d * (i == j) for i, v in enumerate(k))
+                lo, hi = LIMITS[j + 1]
+                if n not in came and lo <= at(n)[j + 1] <= hi and clear(at(k), at(n), 2):
+                    came[n] = k
+                    queue.append(n)
+    raise ValueError(f"no way up from here without going lower first: {LIFT_RECOVERY}")
+
+
+def travel_moves(q, q_to, table_z=0.0, op_xy=None):
+    """The trajectories [[q]] of a travel move from q to q_to: a low arm (a stop mid-descent, a hand move) first
+    lifts straight up, then the checked move. ValueError before anything moves if either can't be done."""
+    lift = [] if fk(q)[2] >= table_z + CLEAR else lift_path(q, table_z, op_xy)     # fails closed on nan
+    check_travel(lift[-1] if lift else q, q_to, table_z)
+    return [lift, [q_to]] if lift else [[q_to]]
+
+
+def wake_moves(q, table_z=0.0, op_xy=None):
+    """The trajectories [[q]] of a wake from q: home's own way up when it has one (straight up, so nothing next
+    to the arm is swept aside), otherwise wake_path()."""
+    try:
+        return travel_moves(q, HOME, table_z, op_xy)
+    except ValueError:
+        return [wake_path(q)]
 
 
 if __name__ == "__main__":
@@ -172,7 +264,31 @@ if __name__ == "__main__":
         try:                                                                            # command can lift, the
             lift_path(q, 0.0)                                                           # straight line digs in
         except ValueError as e:
-            assert "hand" in str(e) and "torque" in str(e) and "home" in str(e), str(e)
+            assert "wake" in str(e) and "home" in str(e), str(e)
         else:
             raise AssertionError(f"{q} should be unrecoverable by lift_path")
+    assert self_gap(home) > SELF_CLEAR and self_gap(show) > SELF_CLEAR
+    assert self_gap((0.0, 1.47, 1.37, 0.21)) == 0.0             # gripper folded back through the base column
+    for q in ((0.0, 1.5, -1.2, -0.2), (-0.61, 0.53, 1.26, -1.45), (1.0, 1.0, 1.0, 1.0), (0.0, 1.2, 0.9, 0.3),
+              (0.0, -1.5, 1.4, 0.3)):                           # lying stretched out, tilted, folded on the base
+        pts, floor = wake_path(q), min(heights(q)) - 2.0        # poses no home could lift: wake_path does, nothing
+        gap = min(SELF_CLEAR, self_gap(q)) - 2.0                # dips on the way and the arm stays clear of itself
+        assert pts[-1] == home, pts
+        for a, b in zip([q, *pts], pts):
+            for c in (tuple(m + (w - m) * i / 50 for m, w in zip(a, b)) for i in range(51)):
+                assert min(heights(c)) > floor - 1.0 and self_gap(c) > gap, (q, c)
+    assert wake_path(home) == [home]
+    assert wake_path((0.0, 0.0, 0.0, 0.0)) == [home]            # from above home (fake hardware starts here): down to it
+    try:
+        wake_path((0.0, 3.0, 0.0, 0.0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("joints outside their limits should be refused")
+    assert wake_path((0.0, 1.0, 1.43, 0.0))[-1] == home         # resting on joint3's end stop, just past its limit
+    assert wake_moves(home) == [[HOME]]
+    low = ik(J1_X + 150.0, 40.0, GRASP_Z + 10.0)                # a low pose home can lift: straight up, then home
+    assert wake_moves(low) == [lift_path(low, 0.0), [HOME]]
+    lying = (0.0, 1.5, -1.2, -0.2)                              # one it can't: joint by joint
+    assert wake_moves(lying) == [wake_path(lying)]
     print("kinematics ok")
