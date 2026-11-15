@@ -141,18 +141,28 @@ cmd_run() {
     shift
     if [ "${1:-}" = "--fake" ]; then arm_args=(--fake); vision=synthetic; shift; fi
     [ -x venv/bin/python ] || die "run ./lab.sh setup first"
+    [ -t 0 ] || die "run needs a terminal: before stopping the arm it waits for someone to hold it"
     mkdir -p logs
     # its own process group: when the ROS side dies it kills its group, and the runner must stay up to show why
     setsid "$SELF" arm "${arm_args[@]}" >"$log" 2>&1 &
-    ARM_PID=$!      # global: the EXIT trap runs after cmd_run has returned
+    ARM_PID=$! ARM_LOG=$log ARM_UP=     # global: the EXIT trap runs after cmd_run has returned
     # stopping the ROS side drops the arm, also when the runner ends by itself (a typo, a crash): wait for a hand on it
     stop_arm() {
-        trap - EXIT INT TERM HUP
-        if kill -0 "$ARM_PID" 2>/dev/null && [ -t 0 ]; then
-            read -rp "HOLD THE ARM, then press Enter: stopping lets its motors go. " || true
+        trap - EXIT TERM
+        trap '' INT HUP             # a second Ctrl-C or a closed window must not cut this short
+        kill -0 "$ARM_PID" 2>/dev/null || return 0
+        # the runner, and with it the panel's STOP, is gone: halt whatever the arm still does, its torque stays on
+        if [ -n "$ARM_UP" ] && ! timeout 20 "$SELF" cmd '{"op": "stop"}' >/dev/null 2>&1; then
+            echo "WARNING: the arm didn't confirm the stop: it may still be moving" >&2
         fi
-        kill -INT -- -"$ARM_PID" 2>/dev/null || true
-        wait "$ARM_PID" 2>/dev/null || true
+        if read -rp "HOLD THE ARM, then press Enter: stopping lets its motors go. "; then
+            kill -INT -- -"$ARM_PID" 2>/dev/null || true
+            wait "$ARM_PID" 2>/dev/null || true
+        else                        # no answer (the window was closed): better left held up than dropped
+            local msg="The ROS side still runs and holds the arm up. To stop it: hold the arm, then kill -INT -- -$ARM_PID"
+            echo "$msg" >>"$ARM_LOG"
+            echo "$msg" >&2 || true
+        fi
     }
     trap stop_arm EXIT INT TERM HUP
     echo "Starting the arm. It rises to its home pose by itself and can sweep sideways: NO PIECES near it yet."
@@ -162,6 +172,7 @@ cmd_run() {
         sleep 1
     done
     grep -q '^ARM AWAKE' "$log" || { why; die "the arm isn't ready: see above, all of it is in $log"; }
+    ARM_UP=1
     echo "Arm is up: now lay out the pieces. Open http://localhost:8081 and press Start."
     echo "Ctrl-C here stops everything: it asks you to hold the arm first, its motors let go."
     "$SELF" python runner.py --participant "$participant" --vision "$vision" "$@"
