@@ -456,7 +456,7 @@ def detect(frames, views, calib, params):
     # the background, walls and cloth come in)
     pl = [p for p in pl if seen_by(views[1], p.table_mm)]
     pr = [q for q in pr if seen_by(views[0], q.table_mm)]
-    matched = pieces.matched_pieces(calib, pl, pr)
+    matched = pieces.matched_pieces(calib, pl, pr, max_mm=params["match_mm"])
     paired = set()
     for p, st in matched:
         if st is not None:      # its right partner: same colour, nearest on the table
@@ -464,7 +464,13 @@ def detect(frames, views, calib, params):
                     key=lambda q: np.hypot(q.table_mm[0] - p.table_mm[0], q.table_mm[1] - p.table_mm[1]))
             paired.add(id(q))
     lone = ([p for p, st in matched if st is None], [q for q in pr if id(q) not in paired])
-    return {"matched": matched, "found": (pl, pr), "misses": (ml, mr), "tops": (tl, tr), "lone": lone}
+    # why a piece wasn't paired: how far the other camera's nearest piece of that colour is, on the table
+    notes = {}
+    for mine, other, name in ((lone[0], pr, "R"), (lone[1], pl, "L")):
+        for p in mine:
+            d = [np.hypot(q.table_mm[0] - p.table_mm[0], q.table_mm[1] - p.table_mm[1]) for q in other if q.color == p.color]
+            notes[id(p)] = f"{name} {min(d):.0f} mm away" if d else f"{name} sees none"
+    return {"matched": matched, "found": (pl, pr), "misses": (ml, mr), "tops": (tl, tr), "lone": lone, "notes": notes}
 
 
 # ---------------------------------------------------------------- pictures
@@ -514,7 +520,7 @@ def picture(E: Engine, name, mask=None, misses=False, lone=False):
         if kind == "top":
             pic = pieces.draw_top(pic, found, near, view.ppm, alone)
         else:
-            pic = pieces.draw_misses(pieces.draw(pic, found, view, lone=alone), near, view)
+            pic = pieces.draw_misses(pieces.draw(pic, found, view, lone=alone, notes=det["notes"]), near, view)
     return pic
 
 
@@ -782,7 +788,7 @@ def detection_panel(E):
                 mask = ui.select({"": "no mask", **{c: f"{c} mask" for c in pieces.COLORS}}, value="") \
                     .props("dense outlined").classes("w-36").tooltip("Only the pixels that pass a colour's thresholds")
                 ui.space()
-                show_lone = ui.switch("One-camera").tooltip(
+                show_lone = ui.switch("One-camera", value=True).tooltip(
                     "Also show what only one camera sees (grey, with ?). The runner ignores those: only pieces both "
                     "cameras agree on count")
                 show_misses = ui.switch("Near misses").tooltip(
@@ -882,9 +888,9 @@ def detection_panel(E):
             if d:
                 rows = [{"c": p.color, "xyz": f"{st[0]:.0f}, {st[1]:.0f}, {st[2]:.0f}"} for p, st in d["matched"]
                         if st is not None]
-                n_lone = len(d["lone"][0]) + len(d["lone"][1])
-                if n_lone:
-                    rows.append({"c": "", "xyz": f"+ {n_lone} seen by one camera only (ignored)"})
+                for side_name, alone in zip(("left", "right"), d["lone"]):
+                    for p in alone[:8]:
+                        rows.append({"c": f"{p.color} ?", "xyz": f"{side_name} only: {d['notes'].get(id(p), '')}"})
                 if rows != shown["rows"]:
                     shown["rows"] = rows
                     table.rows = rows
@@ -915,6 +921,14 @@ def threshold_sliders(E):
             with ui.row().classes("w-full items-center no-wrap gap-2"):
                 ui.label(label).classes("text-xs w-14")
                 widgets[key] = ui.slider(min=0.2, max=1.0, step=0.05, value=E.params[key]).props("label").classes("flex-1")
+        ui.label("stereo").classes("text-sm font-medium mt-1")
+        with ui.row().classes("w-full items-center no-wrap gap-2"):
+            ui.label("match ≤ mm").classes("text-xs w-14")
+            widgets["match_mm"] = ui.slider(min=5, max=40, step=1, value=E.params["match_mm"]).props("label").classes("flex-1")
+        ui.label("How far apart the two cameras may put the same piece and still pair it. Grey pieces with ? say how "
+                 "far the other camera's sighting is: if that is more than a few mm everywhere, the calibration is off "
+                 "(capture the board on the table again, add lens views); raising this is the quick fix.") \
+            .classes("text-xs opacity-60")
         ui.label("Fill: share of the top that has the colour (lower finds more). Rim: share of the top's edge that is "
                  "visible (lower finds more). Around: share of a ring just outside the top with the same colour; a "
                  "piece has other things around it, a blue-ish wall or cloth doesn't (lower rejects more surfaces).") \

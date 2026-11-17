@@ -36,7 +36,9 @@ COLORS = {
 # max_around: share of a ring just outside the top that may have the same colour. A piece top has something else
 # around it (its own side covers ~30% of that ring, a group of same-coloured pieces more); a blue-ish wall or cloth is
 # blue all around. 0.9 keeps tight groups of same-coloured pieces.
-DEFAULT_PARAMS = {"colors": COLORS, "min_fill": 0.55, "min_rim": 0.6, "max_around": 0.9}
+# match_mm: how far apart the two cameras may put the same piece on the table and still pair it (a calibration
+# that isn't perfect needs more; pieces are >= 40 mm apart, so not much over 20).
+DEFAULT_PARAMS = {"colors": COLORS, "min_fill": 0.55, "min_rim": 0.6, "max_around": 0.9, "match_mm": 20.0}
 DRAW = {"red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0)}
 
 
@@ -48,7 +50,7 @@ def load_params(path=None):
         for name, c in saved.get("colors", {}).items():
             if name in params["colors"]:
                 params["colors"][name] |= {k: tuple(v) if k == "h" else v for k, v in c.items() if k in ("h", "s", "v")}
-        params |= {k: float(saved[k]) for k in ("min_fill", "min_rim", "max_around") if k in saved}
+        params |= {k: float(saved[k]) for k in ("min_fill", "min_rim", "max_around", "match_mm") if k in saved}
     return params
 
 
@@ -408,7 +410,7 @@ def draw_top(top, found, misses, ppm, lone=()):
     return vis
 
 
-def draw(img, pieces, view: TopView | None = None, radius_px=None, lone=()):
+def draw(img, pieces, view: TopView | None = None, radius_px=None, lone=(), notes=None):
     """Draw top-face outlines + bounding boxes on the original image. Pieces in lone (seen by this camera only,
     which is where false detections come from) are drawn thin and grey, with a "?"."""
     vis = img.copy()
@@ -423,7 +425,7 @@ def draw(img, pieces, view: TopView | None = None, radius_px=None, lone=()):
             bottom = view.project(np.c_[x + r * np.cos(ang), y + r * np.sin(ang), np.full(48, z - PIECE_H_MM)])
             bx, by, bw, bh = cv2.boundingRect(np.vstack([top, bottom]).astype(np.float32))
             cv2.polylines(vis, [top.round().astype(np.int32)], True, col, 1 if alone else 2, cv2.LINE_AA)
-            label = f"{p.color} ({x:.0f}, {y:.0f})" + (" ?" if alone else "")
+            label = f"{p.color} ({x:.0f}, {y:.0f})" + (f" ? {(notes or {}).get(id(p), '')}" if alone else "")
         else:
             u, v = p.image_uv
             bx, by, bw, bh = int(u - radius_px), int(v - radius_px), int(2 * radius_px), int(2 * radius_px)
@@ -456,7 +458,7 @@ def view_from_calib(calib, camera="left", table_offset_mm=0.0, ppm=2.0):
     return TopView(cam.K, cam.dist, T, z_mm=PIECE_H_MM - table_offset_mm, ppm=ppm, image_size=cam.image_size)
 
 
-def matched_pieces(calib, left_pieces, right_pieces, max_mm=15.0, max_dz=0.6 * PIECE_H_MM):
+def matched_pieces(calib, left_pieces, right_pieces, max_mm=DEFAULT_PARAMS["match_mm"], max_dz=0.8 * PIECE_H_MM):
     """Pair left/right detections (same colour, close on the table) and triangulate their top centres.
 
     A pair must also triangulate near the top-face height (max_dz; 1 px of disparity is ~2.5 mm of height at 65 cm
