@@ -33,7 +33,10 @@ COLORS = {
 }
 # Everything the detection GUI can tune. min_fill: share of the top disk that must have the colour; min_rim: share
 # of the rim that must have an edge. Lower = more sensitive (more pieces found, and more false ones).
-DEFAULT_PARAMS = {"colors": COLORS, "min_fill": 0.55, "min_rim": 0.6}
+# max_around: share of a ring just outside the top that may have the same colour. A piece top has something else
+# around it (its own side covers ~30% of that ring, a group of same-coloured pieces more); a blue-ish wall or cloth is
+# blue all around. 0.9 keeps tight groups of same-coloured pieces.
+DEFAULT_PARAMS = {"colors": COLORS, "min_fill": 0.55, "min_rim": 0.6, "max_around": 0.9}
 DRAW = {"red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0)}
 
 
@@ -45,7 +48,7 @@ def load_params(path=None):
         for name, c in saved.get("colors", {}).items():
             if name in params["colors"]:
                 params["colors"][name] |= {k: tuple(v) if k == "h" else v for k, v in c.items() if k in ("h", "s", "v")}
-        params |= {k: float(saved[k]) for k in ("min_fill", "min_rim") if k in saved}
+        params |= {k: float(saved[k]) for k in ("min_fill", "min_rim", "max_around") if k in saved}
     return params
 
 
@@ -61,6 +64,7 @@ class Piece:
     table_mm: tuple[float, float, float] | None  # top-face centre in the table frame
     rim: float                          # fraction of the rim with a matching edge
     fill: float                         # fraction of the top disk with the piece colour
+    around: float = 0.0                 # fraction of a ring just outside the top with the piece colour
 
 
 class TopView:
@@ -72,6 +76,7 @@ class TopView:
         self.tvec = np.asarray(T_cam_table, float)[:3, 3]
         self.T = np.asarray(T_cam_table, float)
         self.cam_c = -self.T[:3, :3].T @ self.tvec  # camera centre in the table frame
+        self.image_size = image_size
         x0, x1, y0, y1 = bounds or self.visible_bounds(image_size)
         self.x0, self.y1 = x0, y1
         xs = np.arange(x0, x1, 1 / ppm)
@@ -230,7 +235,8 @@ def rim_votes(gx, gy, mag, edge_thr, r_px, min_rim):
     return [tuple(c) for c in centroids[1:]]
 
 
-def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=None, smear=None, rejected=None):
+def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=None, smear=None, rejected=None,
+           max_around=0.9):
     """Find top-face circles of radius r_px. Returns [(color, u, v, rim, fill)].
 
     smear(u, v) -> (du, dv): where a piece's side shows in this image (TopView.smear). Without it, a candidate on
@@ -252,6 +258,12 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     inner = _disk(0.8 * r_px).astype(np.float32)
     inner /= inner.sum()
     fills = {c: cv2.filter2D(m.astype(np.float32), -1, inner, borderType=cv2.BORDER_CONSTANT) for c, m in masks.items()}
+    ring = _disk(1.45 * r_px).astype(np.float32)
+    hole = _disk(1.1 * r_px).astype(np.float32)
+    o = (ring.shape[0] - hole.shape[0]) // 2
+    ring[o:o + hole.shape[0], o:o + hole.shape[1]] -= hole
+    ring /= ring.sum()
+    arounds = {c: cv2.filter2D(m.astype(np.float32), -1, ring, borderType=cv2.BORDER_CONSTANT) for c, m in masks.items()}
     # Mean brightness of the disk: the top face is lit from above, the piece's side (smeared outwards
     # in the top view) is darker, so among overlapping candidates the brightest one is the top.
     bright = cv2.filter2D(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32) / 255, -1, inner,
@@ -309,10 +321,12 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
             k = int(s.argmax()) if s.max() > 0 else int(raw.argmax())   # nothing passes yet: follow the best try
             x, y = xs[k], ys[k]
         name = names[ci[k]]
-        if s[k] > 0:
+        h_, w_ = arounds[name].shape
+        around = float(arounds[name][min(max(int(round(y)), 0), h_ - 1), min(max(int(round(x)), 0), w_ - 1)])
+        if s[k] > 0 and around <= max_around:
             results.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(br[k])))
         elif rejected is not None and fill[k] >= 0.4 and rim[k] >= 0.3:   # roughly piece-like only
-            rejected.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(raw[k])))
+            rejected.append((name, float(x), float(y), float(rim[k]), float(fill[k]), around, float(raw[k])))
 
     # Non-max suppression, best score first: one detection per piece. A candidate on the same piece as a kept one
     # (same_piece) is dropped, unless it lies further from the camera along the side band and scores at least half
@@ -330,11 +344,11 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
             if toward_camera(k[1:3], r[1:3], smear) < -0.3 * r_px and sc(r) >= 0.5 * sc(k):
                 kept[dup[0]] = r
     if rejected is not None:     # one near miss per place, and none on a detected piece
-        misses, rejected[:] = sorted(rejected, key=lambda r: r[5], reverse=True), []
+        misses, rejected[:] = sorted(rejected, key=lambda r: r[6], reverse=True), []
         for r in misses:
             if all(np.hypot(r[1] - k[1], r[2] - k[2]) > 1.4 * r_px for k in kept + rejected):
                 rejected.append(r)
-        rejected[:] = [r[:5] for r in rejected[:15]]
+        rejected[:] = [r[:6] for r in rejected[:15]]
     return [r[:5] for r in kept]
 
 
@@ -343,19 +357,20 @@ def detect_pieces(img, view: TopView | None = None, radius_px=None, params=None,
     params: load_params(); the defaults if None. rejected: a list to receive the near misses as Pieces (see
     detect). top: view.warp(img) if the caller already has it."""
     p = params or DEFAULT_PARAMS
-    kw = dict(colors=p["colors"], min_rim=p["min_rim"], min_fill=p["min_fill"])
+    kw = dict(colors=p["colors"], min_rim=p["min_rim"], min_fill=p["min_fill"],
+              max_around=p.get("max_around", DEFAULT_PARAMS["max_around"]))
     misses = None if rejected is None else []
     if view is None:
         found = detect(img, radius_px, rejected=misses, **kw)
         if rejected is not None:
-            rejected += [Piece(c, (u, v), (u, v), None, rim, fill) for c, u, v, rim, fill in misses]
+            rejected += [Piece(c, (u, v), (u, v), None, rim, fill, around) for c, u, v, rim, fill, around in misses]
         return [Piece(c, (u, v), (u, v), None, rim, fill) for c, u, v, rim, fill in found]
     top = view.warp(img) if top is None else top
 
-    def piece(c, u, v, rim, fill):
+    def piece(c, u, v, rim, fill, around=0.0):
         x, y = view.view_to_table(u, v)
         iu, iv = view.project([[x, y, view.z]])[0]
-        return Piece(c, (u, v), (float(iu), float(iv)), (x, y, view.z), rim, fill)
+        return Piece(c, (u, v), (float(iu), float(iv)), (x, y, view.z), rim, fill, around)
     found = detect(top, PIECE_D_MM / 2 * view.ppm, smear=view.smear, rejected=misses, **kw)
     if rejected is not None:
         rejected += [piece(*m) for m in misses]
@@ -370,7 +385,7 @@ def draw_misses(vis, misses, view: TopView):
         x, y, z = p.table_mm
         ring = view.project(np.c_[x + PIECE_D_MM / 2 * np.cos(ang), y + PIECE_D_MM / 2 * np.sin(ang), np.full(32, z)])
         cv2.polylines(vis, [ring.round().astype(np.int32)], True, (170, 170, 170), 1, cv2.LINE_AA)
-        label = f"{p.color}? rim {p.rim:.2f} fill {p.fill:.2f}"
+        label = f"{p.color}? rim {p.rim:.2f} fill {p.fill:.2f} around {p.around:.2f}"
         at = (int(ring[:, 0].min()), int(ring[:, 1].max()) + 14)
         cv2.putText(vis, label, at, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(vis, label, at, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
@@ -384,7 +399,7 @@ def draw_top(top, found, misses, ppm, lone=()):
     for p in misses:
         c = tuple(int(round(v)) for v in p.view_uv)
         cv2.circle(vis, c, r, (170, 170, 170), 1, cv2.LINE_AA)
-        cv2.putText(vis, f"rim {p.rim:.2f} fill {p.fill:.2f}", (c[0] - r, c[1] + r + 14), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(vis, f"rim {p.rim:.2f} fill {p.fill:.2f} around {p.around:.2f}", (c[0] - r, c[1] + r + 14), cv2.FONT_HERSHEY_SIMPLEX,
                     0.45, (200, 200, 200), 1, cv2.LINE_AA)
     for p in found:
         alone = any(p is q for q in lone)

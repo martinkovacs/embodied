@@ -433,6 +433,17 @@ class Engine:
         return f"{color}: {', '.join(changed) or 'no change needed'}"
 
 
+def seen_by(view, xyz):
+    """Is the table point (mm) inside this camera's top view, i.e. in its picture?"""
+    u, v = (xyz[0] - view.x0) * view.ppm, (view.y1 - xyz[1]) * view.ppm
+    h, w = view.maps.shape[:2]
+    if not (0 <= u < w and 0 <= v < h):
+        return False
+    mx, my = view.maps[int(v), int(u)]     # where the top-view pixel comes from in the camera image
+    iw, ih = view.image_size
+    return bool(0 <= mx < iw and 0 <= my < ih)
+
+
 def detect(frames, views, calib, params):
     """Both cameras' pieces, paired: {"matched": [(left Piece, table xyz or None)], and per camera (left, right):
     "found", "misses" (near misses), "tops" (top views), "lone" (pieces only that camera sees)}."""
@@ -441,6 +452,10 @@ def detect(frames, views, calib, params):
         return pieces.detect_pieces(frames[i], views[i], params=params, rejected=misses, top=top), misses, top
     with ThreadPoolExecutor(2) as pool:
         (pl, ml, tl), (pr, mr, tr) = pool.map(one, (0, 1))
+    # only where both cameras look: a detection the other camera can't see can never be confirmed (that's where
+    # the background, walls and cloth come in)
+    pl = [p for p in pl if seen_by(views[1], p.table_mm)]
+    pr = [q for q in pr if seen_by(views[0], q.table_mm)]
     matched = pieces.matched_pieces(calib, pl, pr)
     paired = set()
     for p, st in matched:
@@ -454,7 +469,7 @@ def detect(frames, views, calib, params):
 
 # ---------------------------------------------------------------- pictures
 
-def picture(E: Engine, name, mask=None, misses=False):
+def picture(E: Engine, name, mask=None, misses=False, lone=False):
     """One picture for the UI as BGR: calib_<side> (live, board corners, coverage, table axes), cam_<side>
     (detection on the camera image), top_<side> (detection on the top view). None if there's nothing to show."""
     kind, side = name.split("_")
@@ -493,12 +508,13 @@ def picture(E: Engine, name, mask=None, misses=False):
     if mask:
         pic = pieces.mask_view(pic, params, mask)
     if det:
-        found, lone = det["found"][i], det["lone"][i]
+        alone = det["lone"][i]
+        found = det["found"][i] if lone else [p for p in det["found"][i] if not any(p is q for q in alone)]
         near = det["misses"][i] if misses else []
         if kind == "top":
-            pic = pieces.draw_top(pic, found, near, view.ppm, lone)
+            pic = pieces.draw_top(pic, found, near, view.ppm, alone)
         else:
-            pic = pieces.draw_misses(pieces.draw(pic, found, view, lone=lone), near, view)
+            pic = pieces.draw_misses(pieces.draw(pic, found, view, lone=alone), near, view)
     return pic
 
 
@@ -512,9 +528,9 @@ def placeholder(text):
 
 def build_ui(E: Engine):
     @app.get("/v2img/{name}.jpg")
-    def image(name: str, mask: str = "", misses: int = 0):    # a plain def: FastAPI runs it in a worker thread
+    def image(name: str, mask: str = "", misses: int = 0, lone: int = 0):    # FastAPI runs a plain def in a thread
         try:
-            img = picture(E, name, mask or None, bool(misses))
+            img = picture(E, name, mask or None, bool(misses), bool(lone))
         except Exception as e:
             img = placeholder(f"error: {e}"[:60])
         if img is None:
@@ -766,15 +782,19 @@ def detection_panel(E):
                 mask = ui.select({"": "no mask", **{c: f"{c} mask" for c in pieces.COLORS}}, value="") \
                     .props("dense outlined").classes("w-36").tooltip("Only the pixels that pass a colour's thresholds")
                 ui.space()
+                show_lone = ui.switch("One-camera").tooltip(
+                    "Also show what only one camera sees (grey, with ?). The runner ignores those: only pieces both "
+                    "cameras agree on count")
                 show_misses = ui.switch("Near misses").tooltip(
                     "Grey circles with scores where something piece-like was rejected: which minimum keeps it out")
                 live = ui.switch("Live detection", value=True)
                 ui.button(icon="fullscreen", on_click=lambda: open_full()).props("flat dense").tooltip("Full screen")
             with ui.row().classes("w-full no-wrap gap-2"):
                 imgs = {s: ui.interactive_image(events=["click"]).classes("w-full cursor-crosshair") for s in SIDES}
-            ui.label("Coloured: detected by both cameras. Grey with ?: only this camera sees it (ignored). Near misses "
-                     "(switch): thin grey with scores, the one under its minimum keeps it out. Click the middle of a "
-                     "piece's top to tune its colour to it.").classes("text-xs opacity-60")
+            ui.label("Coloured: a piece both cameras agree on (what the runner uses). One-camera (switch): grey with ?, "
+                     "seen by one camera only, ignored. Near misses (switch): thin grey with scores, the one past its "
+                     "limit keeps it out. Click the middle of a piece's top to tune its colour to it.") \
+                .classes("text-xs opacity-60")
         with ui.card().classes("w-[400px] shrink-0 gap-2 overflow-auto").style("max-height: calc(100vh - 140px)"):
             ui.label("Thresholds").classes("font-medium")
             with ui.row().classes("w-full items-center no-wrap gap-2"):
@@ -845,12 +865,13 @@ def detection_panel(E):
         def tick(self):
             d = E.det
             dkey = d["key"] if d else None
-            key = (E.frame_id, dkey, kind.value, side.value, mask.value, show_misses.value, full["open"], E.params_id)
+            key = (E.frame_id, dkey, kind.value, side.value, mask.value, show_misses.value, show_lone.value, full["open"],
+                   E.params_id)
             if key == shown["key"] or time.monotonic() - shown["t"] < 0.15:
                 return
             shown["key"], shown["t"] = key, time.monotonic()
             k = f"{E.frame_id}-{dkey[0] if dkey else 0}-{dkey[1] if dkey else 0}-{E.params_id}"
-            q = f"?k={k}&mask={mask.value}&misses={int(show_misses.value)}"
+            q = f"?k={k}&mask={mask.value}&misses={int(show_misses.value)}&lone={int(show_lone.value)}"
             for s, img in imgs.items():
                 img.set_visibility(side.value in (s, "both"))
                 img.set_source(f"/v2img/{kind.value}_{s}.jpg{q}")
@@ -859,8 +880,11 @@ def detection_panel(E):
                 full_title.text = f"{s} camera · {'top view' if kind.value == 'top' else 'image'}"
                 full_img.set_source(f"/v2img/{kind.value}_{s}.jpg{q}")
             if d:
-                rows = [{"c": p.color, "xyz": "one camera only (ignored)" if st is None
-                         else f"{st[0]:.0f}, {st[1]:.0f}, {st[2]:.0f}"} for p, st in d["matched"]]
+                rows = [{"c": p.color, "xyz": f"{st[0]:.0f}, {st[1]:.0f}, {st[2]:.0f}"} for p, st in d["matched"]
+                        if st is not None]
+                n_lone = len(d["lone"][0]) + len(d["lone"][1])
+                if n_lone:
+                    rows.append({"c": "", "xyz": f"+ {n_lone} seen by one camera only (ignored)"})
                 if rows != shown["rows"]:
                     shown["rows"] = rows
                     table.rows = rows
@@ -887,12 +911,14 @@ def threshold_sliders(E):
                 ui.label("V ≥").classes("text-xs w-8")
                 widgets[name, "v"] = ui.slider(min=0, max=255, value=c["v"]).props("label").classes("flex-1")
         ui.label("shape").classes("text-sm font-medium mt-1")
-        for key, label in (("min_fill", "fill ≥"), ("min_rim", "rim ≥")):
+        for key, label in (("min_fill", "fill ≥"), ("min_rim", "rim ≥"), ("max_around", "around ≤")):
             with ui.row().classes("w-full items-center no-wrap gap-2"):
-                ui.label(label).classes("text-xs w-12")
-                widgets[key] = ui.slider(min=0.2, max=0.95, step=0.05, value=E.params[key]).props("label").classes("flex-1")
-        ui.label("Lower = more sensitive: more pieces found, and more false ones. Fill: share of the top that has the "
-                 "colour. Rim: share of the top's edge that is visible.").classes("text-xs opacity-60")
+                ui.label(label).classes("text-xs w-14")
+                widgets[key] = ui.slider(min=0.2, max=1.0, step=0.05, value=E.params[key]).props("label").classes("flex-1")
+        ui.label("Fill: share of the top that has the colour (lower finds more). Rim: share of the top's edge that is "
+                 "visible (lower finds more). Around: share of a ring just outside the top with the same colour; a "
+                 "piece has other things around it, a blue-ish wall or cloth doesn't (lower rejects more surfaces).") \
+            .classes("text-xs opacity-60")
     loading = {"on": False}
 
     def changed(key, value):
