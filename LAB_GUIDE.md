@@ -62,10 +62,10 @@ Plug in both cameras too, if they aren't already.
 ## 4. Calibrate the cameras
 
 ```bash
-./lab.sh python calib_gui.py
+./lab.sh python calib_app.py
 ```
 
-A window opens.
+Open <http://localhost:8080> (`calib_gui.py` is the old version of the same, kept for now).
 
 1. **Setup tab:** press **Use the Basler cameras** (the ⇄ button swaps left and right). Set the board's real square
    size and thickness. Press **Connect**.
