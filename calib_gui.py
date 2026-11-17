@@ -69,6 +69,7 @@ class State:
         self.rect_maps = None
         self.views = None  # (TopView left, TopView right) for detection
         self.last_auto = 0.0
+        self.params = pieces.load_params()
         self.table_name = None  # the pair with the board flat on the table: it sets the table pose
         self.result = None      # (check, models) of the last calibration
 
@@ -372,20 +373,31 @@ def detect_both(left, right, mask_color=None):
 
 
 def teach_click(img, side, u, v, kind, color=None):
-    """A click on a piece (camera image or top-view pixel): widen its colour's thresholds until it's detected.
-    Returns a message."""
+    """A click on a piece's top (camera image pixel, or top-view pixel): widen its colour's thresholds until it's
+    detected. The colours are sampled right where the click is, in the picture clicked. Returns a message."""
     view = S.views[0 if side == "left" else 1]
-    if kind == "cam":
-        u, v = view.image_to_view(u, v)
+    r_top = pieces.PIECE_D_MM / 2 * view.ppm
     top = view.warp(img)
-    color, changed = pieces.teach(top, u, v, view.ppm, S.params, color)
-    r = pieces.PIECE_D_MM / 2 * view.ppm
+    if kind == "top":
+        r, at = r_top, lambda p: p.view_uv
+        color, changed = pieces.teach(top, u, v, r, S.params, color)
+    else:
+        try:   # the top face's radius in the image there: a circle at piece height, projected
+            x, y = view.view_to_table(*view.image_to_view(u, v))
+            ang = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+            ring = view.project(np.c_[x + pieces.PIECE_D_MM / 2 * np.cos(ang), y + pieces.PIECE_D_MM / 2 * np.sin(ang),
+                                      np.full(16, view.z)])
+            r = float(np.clip(np.hypot(ring[:, 0] - u, ring[:, 1] - v).min(), 4, 150))
+        except Exception:
+            r = 15.0
+        at = lambda p: p.image_uv
+        color, changed = pieces.teach(img, u, v, r, S.params, color)
     for _ in range(2):    # still not found: the rim or fill score keeps it out, lower that floor (not below 0.3)
         misses = []
         found = pieces.detect_pieces(img, view, params=S.params, rejected=misses, top=top)
-        if any(np.hypot(p.view_uv[0] - u, p.view_uv[1] - v) < r for p in found):
+        if any(np.hypot(at(p)[0] - u, at(p)[1] - v) < 1.5 * r for p in found):
             return f"{color}: {', '.join(changed) or 'thresholds already fit'}: detected"
-        near = [m for m in misses if np.hypot(m.view_uv[0] - u, m.view_uv[1] - v) < r]
+        near = [m for m in misses if np.hypot(at(m)[0] - u, at(m)[1] - v) < 1.5 * r]
         if not near:
             break
         m = near[0]
@@ -395,7 +407,8 @@ def teach_click(img, side, u, v, kind, color=None):
                 if new < S.params[key]:
                     changed.append(f"{key} {S.params[key]:.2f} -> {new:.2f}")
                     S.params[key] = new
-    return f"{color}: {', '.join(changed) or 'no change'}: still not detected (not a whole piece top there?)"
+    return (f"{color}: {', '.join(changed) or 'no change'}: still not detected there. Check the Top view: the piece "
+            "must be inside it, and the table pose must match where the camera is now")
 
 
 # ---------- UI ----------

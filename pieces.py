@@ -148,16 +148,16 @@ def hue_in(h, lo):
     return np.where(h >= 90, h - 180, h) if lo < 0 else h
 
 
-def teach(top, u, v, ppm, params, color=None):
-    """Widen color's thresholds (or the colour nearest in hue) so the top face clicked at top-view (u, v) passes:
-    hue range over its 2nd-98th percentile, S and V floors under its 10th percentile, with some margin. Only ever
-    widens. Returns (colour, what changed) or raises ValueError when the spot isn't a coloured piece."""
-    r = PIECE_D_MM / 2 * ppm
-    yy, xx = np.ogrid[:top.shape[0], :top.shape[1]]
-    disk = (xx - u) ** 2 + (yy - v) ** 2 <= (0.6 * r) ** 2
-    hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV)[disk].astype(float)
-    if len(hsv) < 20:
-        raise ValueError("that's outside the area the detector looks at")
+def teach(img, u, v, radius_px, params, color=None):
+    """Widen color's thresholds (or the colour nearest in hue) so the piece top clicked at (u, v) in img (a camera
+    image or a top view; radius_px: the top face's radius there) passes: hue range over its 2nd-98th percentile,
+    S and V floors under its 10th percentile, with some margin. Only ever widens. Returns (colour, what changed),
+    or raises ValueError when the spot isn't a coloured piece."""
+    yy, xx = np.ogrid[:img.shape[0], :img.shape[1]]
+    disk = (xx - u) ** 2 + (yy - v) ** 2 <= (0.6 * radius_px) ** 2
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[disk].astype(float)
+    if len(hsv) < 5:
+        raise ValueError(f"the click at ({u:.0f}, {v:.0f}) is outside the {img.shape[1]} x {img.shape[0]} image")
     H, S, V = hsv.T
     if np.median(S) < 35:
         raise ValueError("no colour there (the table?): click the middle of a piece's top")
