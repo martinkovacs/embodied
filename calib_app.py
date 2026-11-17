@@ -370,8 +370,9 @@ class Engine:
                 time.sleep(0.1)
                 continue
             try:
+                t0 = time.monotonic()
                 det = detect(frames, views, calib, params)
-                det.update(frames=frames, key=key)
+                det.update(frames=frames, key=key, seconds=time.monotonic() - t0)
                 with self.lock:
                     if self.calib_id == key[2]:
                         self.det, self.det_error = det, None
@@ -396,19 +397,21 @@ class Engine:
 
     def teach(self, side, kind, u, v, color=None):
         """A click on a piece's top in a picture (kind "cam": camera pixel, "top": top-view pixel): widen its
-        colour's thresholds until it is detected. Returns a message; raises ValueError if it's not a piece."""
+        colour's thresholds so it passes, and if the latest detection has a near miss there, lower the rim / fill
+        minimum that keeps it out (not below 0.3). Fast: the detection thread shows the result. Returns a message;
+        raises ValueError if the spot isn't a coloured piece."""
         with self.lock:
             det, views, frames = self.det, self.views, self.frames
             params = copy.deepcopy(self.params)
         if views is None:
             raise ValueError("calibrate first")
         i = SIDES.index(side)
-        img = (det["frames"] if det else frames)[i]
-        view = views[i]
-        top = view.warp(img)
+        img, view = frames[i], views[i]
+        if img is None:
+            raise ValueError("no picture yet")
         if kind == "top":
             r, at = pieces.PIECE_D_MM / 2 * view.ppm, (lambda p: p.view_uv)
-            color, changed = pieces.teach(top, u, v, r, params, color)
+            color, changed = pieces.teach(view.warp(img), u, v, r, params, color)
         else:
             x, y = view.view_to_table(*view.image_to_view(u, v))
             ang = np.linspace(0, 2 * np.pi, 16, endpoint=False)
@@ -417,16 +420,8 @@ class Engine:
             r = float(np.clip(np.hypot(ring[:, 0] - u, ring[:, 1] - v).min(), 4, 150)) if np.isfinite(ring).all() else 15.0
             at = lambda p: p.image_uv
             color, changed = pieces.teach(img, u, v, r, params, color)
-        verdict = "still not detected there: is it inside the Top view? has a camera moved since calibrating?"
-        for _ in range(2):      # the colour passes but the rim / fill score keeps it out: lower that (not below 0.3)
-            misses = []
-            found = pieces.detect_pieces(img, view, params=params, rejected=misses, top=top)
-            if any(np.hypot(at(p)[0] - u, at(p)[1] - v) < 1.5 * r for p in found):
-                verdict = "detected"
-                break
-            near = [m for m in misses if np.hypot(at(m)[0] - u, at(m)[1] - v) < 1.5 * r]
-            if not near:
-                break
+        near = [m for m in (det["misses"][i] if det else []) if np.hypot(at(m)[0] - u, at(m)[1] - v) < 1.5 * r]
+        if near:
             for key, score in (("min_rim", near[0].rim), ("min_fill", near[0].fill)):
                 new = max(0.3, round(score - 0.05, 2))
                 if new < params[key]:
@@ -435,7 +430,7 @@ class Engine:
         with self.lock:
             self.params = params
             self.params_id += 1
-        return f"{color}: {', '.join(changed) or 'no change needed'}. {verdict}"
+        return f"{color}: {', '.join(changed) or 'no change needed'}"
 
 
 def detect(frames, views, calib, params):
@@ -459,7 +454,7 @@ def detect(frames, views, calib, params):
 
 # ---------------------------------------------------------------- pictures
 
-def picture(E: Engine, name, mask=None):
+def picture(E: Engine, name, mask=None, misses=False):
     """One picture for the UI as BGR: calib_<side> (live, board corners, coverage, table axes), cam_<side>
     (detection on the camera image), top_<side> (detection on the top view). None if there's nothing to show."""
     kind, side = name.split("_")
@@ -485,24 +480,25 @@ def picture(E: Engine, name, mask=None):
             cam, T = pieces.camera_table_pose(calib, side)
             vis = sc.draw_axes(vis, T, cam, length_mm=3 * E.square)
         return vis
-    base = (det["frames"] if det else frames)[i]
+    base = frames[i]       # always the live frame: the latest detection is drawn on it, a moment old at most
     if base is None:
         return None
     view = views[i] if views else None
     if kind == "top":
         if view is None:
             return None
-        pic = det["tops"][i] if det else view.warp(base)
+        pic = view.warp(base)
     else:
         pic = base
     if mask:
         pic = pieces.mask_view(pic, params, mask)
     if det:
-        found, misses, lone = det["found"][i], det["misses"][i], det["lone"][i]
+        found, lone = det["found"][i], det["lone"][i]
+        near = det["misses"][i] if misses else []
         if kind == "top":
-            pic = pieces.draw_top(pic, found, misses, view.ppm, lone)
+            pic = pieces.draw_top(pic, found, near, view.ppm, lone)
         else:
-            pic = pieces.draw_misses(pieces.draw(pic, found, view, lone=lone), misses, view)
+            pic = pieces.draw_misses(pieces.draw(pic, found, view, lone=lone), near, view)
     return pic
 
 
@@ -516,9 +512,9 @@ def placeholder(text):
 
 def build_ui(E: Engine):
     @app.get("/v2img/{name}.jpg")
-    def image(name: str, mask: str = ""):    # a plain def: FastAPI runs it in a worker thread
+    def image(name: str, mask: str = "", misses: int = 0):    # a plain def: FastAPI runs it in a worker thread
         try:
-            img = picture(E, name, mask or None)
+            img = picture(E, name, mask or None, bool(misses))
         except Exception as e:
             img = placeholder(f"error: {e}"[:60])
         if img is None:
@@ -577,7 +573,7 @@ def build_ui(E: Engine):
                 chip_det.text, color = E.det_error[:50], "negative"
             elif d:
                 n = sum(st is not None for _, st in d["matched"])
-                chip_det.text, color = f"{n} piece{'s' if n != 1 else ''}", "positive"
+                chip_det.text, color = f"{n} piece{'s' if n != 1 else ''} · {d['seconds']:.1f} s", "positive"
             else:
                 chip_det.text, color = "detection off", "grey"
             chip_det.props(f"color={color} text-color=white")
@@ -770,12 +766,14 @@ def detection_panel(E):
                 mask = ui.select({"": "no mask", **{c: f"{c} mask" for c in pieces.COLORS}}, value="") \
                     .props("dense outlined").classes("w-36").tooltip("Only the pixels that pass a colour's thresholds")
                 ui.space()
+                show_misses = ui.switch("Near misses").tooltip(
+                    "Grey circles with scores where something piece-like was rejected: which minimum keeps it out")
                 live = ui.switch("Live detection", value=True)
                 ui.button(icon="fullscreen", on_click=lambda: open_full()).props("flat dense").tooltip("Full screen")
             with ui.row().classes("w-full no-wrap gap-2"):
                 imgs = {s: ui.interactive_image(events=["click"]).classes("w-full cursor-crosshair") for s in SIDES}
-            ui.label("Coloured: detected by both cameras. Grey with ?: only this camera sees it (ignored). Thin grey with "
-                     "scores: a near miss; the score under its minimum is what keeps it out. Click the middle of a "
+            ui.label("Coloured: detected by both cameras. Grey with ?: only this camera sees it (ignored). Near misses "
+                     "(switch): thin grey with scores, the one under its minimum keeps it out. Click the middle of a "
                      "piece's top to tune its colour to it.").classes("text-xs opacity-60")
         with ui.card().classes("w-[400px] shrink-0 gap-2 overflow-auto").style("max-height: calc(100vh - 140px)"):
             ui.label("Thresholds").classes("font-medium")
@@ -836,23 +834,23 @@ def detection_panel(E):
             ui.notify(str(err), type="warning")
             return
         sliders.load()
-        ui.notify(msg + " Press Save to keep it.", type="positive" if msg.endswith("detected") else "warning",
-                  multi_line=True)
+        ui.notify(msg + ". The detection updates in a moment; Save keeps it.", type="positive", multi_line=True)
     for s, img in imgs.items():
         img.on_mouse(lambda e, s=s: click(e, s))
     full_img.on_mouse(lambda e: click(e, "right" if side.value == "right" else "left"))
 
-    shown = {"key": None, "rows": None}
+    shown = {"key": None, "rows": None, "t": 0.0}
 
     class Panel:
         def tick(self):
             d = E.det
-            dkey = d["key"] if d else (E.frame_id, E.params_id)
-            key = (dkey, kind.value, side.value, mask.value, full["open"], E.params_id)
-            if key == shown["key"]:
+            dkey = d["key"] if d else None
+            key = (E.frame_id, dkey, kind.value, side.value, mask.value, show_misses.value, full["open"], E.params_id)
+            if key == shown["key"] or time.monotonic() - shown["t"] < 0.15:
                 return
-            shown["key"] = key
-            q = f"?k={dkey}-{E.params_id}&mask={mask.value}"
+            shown["key"], shown["t"] = key, time.monotonic()
+            k = f"{E.frame_id}-{dkey[0] if dkey else 0}-{dkey[1] if dkey else 0}-{E.params_id}"
+            q = f"?k={k}&mask={mask.value}&misses={int(show_misses.value)}"
             for s, img in imgs.items():
                 img.set_visibility(side.value in (s, "both"))
                 img.set_source(f"/v2img/{kind.value}_{s}.jpg{q}")

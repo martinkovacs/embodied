@@ -311,7 +311,7 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
         name = names[ci[k]]
         if s[k] > 0:
             results.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(br[k])))
-        elif rejected is not None and fill[k] >= 0.25 and rim[k] >= 0.2:
+        elif rejected is not None and fill[k] >= 0.4 and rim[k] >= 0.3:   # roughly piece-like only
             rejected.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(raw[k])))
 
     # Non-max suppression, best score first: one detection per piece. A candidate on the same piece as a kept one
@@ -334,7 +334,7 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
         for r in misses:
             if all(np.hypot(r[1] - k[1], r[2] - k[2]) > 1.4 * r_px for k in kept + rejected):
                 rejected.append(r)
-        rejected[:] = [r[:5] for r in rejected[:40]]
+        rejected[:] = [r[:5] for r in rejected[:15]]
     return [r[:5] for r in kept]
 
 
