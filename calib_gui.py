@@ -339,10 +339,9 @@ def result_text():
     return "\n".join(lines + camera_pose_text().split(" · "))
 
 
-def detect_both(left, right, mask_color=None):
-    """Both cameras' detections, paired, and the pictures of it: {"matched", "cams": (left, right) with the pieces
-    drawn, "tops": the top views the detector works on}. Pieces only one camera sees are grey with a "?": the
-    runner ignores them. Near misses are drawn thin grey with their rim / fill scores."""
+def detect_both(left, right):
+    """Both cameras' detections, paired: {"matched", and per camera (l, r) its pieces, near misses, top view and the
+    pieces only it sees}. render() makes the pictures."""
     vl, vr = S.views
     params = S.params
 
@@ -363,13 +362,31 @@ def detect_both(left, right, mask_color=None):
             paired_r.add(min((q for q in pr if q.color == p.color),
                              key=lambda q: np.hypot(q.table_mm[0] - p.table_mm[0], q.table_mm[1] - p.table_mm[1])).table_mm)
     lone_r = [q for q in pr if q.table_mm not in paired_r] if not one_camera() else []
-    if mask_color:
-        left, right = pieces.mask_view(left, params, mask_color), pieces.mask_view(right, params, mask_color)
-        tl, tr = pieces.mask_view(tl, params, mask_color), pieces.mask_view(tr, params, mask_color)
-    cams = (pieces.draw_misses(pieces.draw(left, pl, vl, lone=lone_l), ml, vl),
-            pieces.draw_misses(pieces.draw(right, pr, vr, lone=lone_r), mr, vr))
-    tops = (pieces.draw_top(tl, pl, ml, vl.ppm, lone_l), pieces.draw_top(tr, pr, mr, vr.ppm, lone_r))
-    return {"matched": matched, "cams": cams, "tops": tops}
+    return {"matched": matched, "found": (pl, pr), "misses": (ml, mr), "tops": (tl, tr), "lone": (lone_l, lone_r)}
+
+
+def render(frames, res, kind, mask_color=None):
+    """The two pictures to show: camera images or top views, with the colour mask applied (only the pixels that pass
+    that colour's thresholds keep their colour) and, given a detection result, the pieces drawn: coloured =
+    detected, grey with a ? = only one camera sees it (the runner ignores it), thin grey with scores = near miss."""
+    out = []
+    for i, img in enumerate(frames):
+        view = S.views[i] if S.views is not None else None
+        if kind == "top":
+            if view is None:
+                out.append(img)
+                continue
+            pic = res["tops"][i] if res else view.warp(img)
+        else:
+            pic = img
+        if mask_color:
+            pic = pieces.mask_view(pic, S.params, mask_color)
+        if res:
+            found, misses, lone = res["found"][i], res["misses"][i], res["lone"][i]
+            pic = pieces.draw_top(pic, found, misses, view.ppm, lone) if kind == "top" else \
+                pieces.draw_misses(pieces.draw(pic, found, view, lone=lone), misses, view)
+        out.append(pic)
+    return out
 
 
 def teach_click(img, side, u, v, kind, color=None):
@@ -900,9 +917,9 @@ def root():
         """Put the latest pictures into the visible image elements (and the zoom dialog)."""
         res, kind, side = det_state.get("res"), det_kind.value, det_side.value
         frames = det_state.get("frames")
-        if frames is None:
+        if frames is None or kind == "3d":
             return
-        pics = (res["cams"] if kind == "cam" else res["tops"]) if res else frames
+        pics = render(res["frames"] if res else frames, res, kind, mask_sel.value or None)
         both = side == "both"
         det_left.visible, det_right.visible = side != "right", side != "left"
         width = 960 if both else 1600
@@ -944,6 +961,7 @@ def root():
     zoom_img.on_mouse(lambda e: on_det_click(e, "left"))
     det_kind.on_value_change(lambda: show_det())
     det_side.on_value_change(lambda: show_det())
+    mask_sel.on_value_change(lambda: show_det())
 
     tab_stage = {t_stereo.props["name"]: "calib", t_3d.props["name"]: "scene",
 }
@@ -991,10 +1009,11 @@ def root():
             elif tab == t_3d.props["name"]:
                 det_state["frames"] = (left, right)
                 if det_sw.value and S.views is not None:
-                    key = hash(left[::16, ::16].tobytes() + right[::16, ::16].tobytes()) + hash(mask_sel.value)
+                    key = hash(left[::16, ::16].tobytes() + right[::16, ::16].tobytes())
                     if key == det_cache.get("key"):
                         return  # same frames as last time (e.g. image files): nothing to redo
-                    res = await run.io_bound(detect_both, left, right, mask_sel.value or None)
+                    res = await run.io_bound(detect_both, left, right)
+                    res["frames"] = (left, right)
                     det_cache["key"] = key
                     det_state.update(res=res, matched=res["matched"])
                     show_det()
