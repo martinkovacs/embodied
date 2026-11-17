@@ -225,8 +225,20 @@ def rectified_pair(left, right):
 # ---------- workers (run in a thread) ----------
 
 def corners_of(img):
+    """The board's corners at full resolution, canonical order. The accurate detector can miss a board the live
+    preview's quick one finds (soft webcam images): then the quick corners, refined at full resolution, so a ✓ in
+    the preview always means a capture works."""
     c = sc.find_corners(img, S.pattern)
-    return None if c is None else sc.canonical_corners(img, c, S.pattern)
+    if c is None:
+        q = quick_corners(img, S.pattern)
+        if q is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        step = np.linalg.norm(q[1] - q[0])                  # one square, px: search half of it
+        win = int(np.clip(step / 4, 3, 15))
+        c = cv2.cornerSubPix(gray, q.reshape(-1, 1, 2).astype(np.float32), (win, win), (-1, -1),
+                             (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)).reshape(-1, 2)
+    return sc.canonical_corners(img, c, S.pattern)
 
 
 def capture_pair(left, right):
