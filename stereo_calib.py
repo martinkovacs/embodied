@@ -88,6 +88,7 @@ class StereoCalib:
     T_left_table: np.ndarray | None = None   # 4x4, table frame -> LEFT camera frame
     pattern: tuple[int, int] = PATTERN
     square_mm: float = 25.0
+    cameras: dict | None = None              # {"left": spec, "right": spec} the calibration was made with
 
     @property
     def baseline_mm(self) -> float:
@@ -140,6 +141,7 @@ class StereoCalib:
             "T": self.T.ravel().tolist(),
             "rms": self.rms,
             "T_left_table": None if self.T_left_table is None else self.T_left_table.tolist(),
+            "cameras": self.cameras,
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -154,7 +156,7 @@ class StereoCalib:
         return cls(left=left, right=right,
                    R=np.array(d["R"]), T=np.array(d["T"]), rms=d["rms"],
                    T_left_table=None if d["T_left_table"] is None else np.array(d["T_left_table"]),
-                   pattern=tuple(d["pattern"]), square_mm=d["square_mm"])
+                   pattern=tuple(d["pattern"]), square_mm=d["square_mm"], cameras=d.get("cameras"))
 
 
 def _rms_px(points2d: np.ndarray, observed: np.ndarray) -> float:
@@ -258,3 +260,75 @@ def draw_axes(img: np.ndarray, T_cam_frame: np.ndarray, cam: CameraCalib,
     cv2.drawFrameAxes(out, cam.K, cam.dist, cv2.Rodrigues(T_cam_frame[:3, :3])[0],
                       T_cam_frame[:3, 3], length_mm)
     return out
+
+
+def canonical_corners(img: np.ndarray, corners: np.ndarray, pattern=PATTERN) -> np.ndarray:
+    """The corners in a fixed order: the outer square diagonally out from the first corner is the dark one.
+
+    A detector may report a board in either of two orders (rotated 180 degrees), so two cameras, or two sessions,
+    could put the table origin at opposite corners. A board with cols + rows odd (9 x 6) has a dark square at one
+    end of that diagonal and a light one at the other, which settles it; other boards are returned as found."""
+    cols, rows = pattern
+    if (cols + rows) % 2 == 0:
+        return corners
+    gray = _to_gray(img).astype(np.float32)
+    c = corners.reshape(-1, 2)
+    n = len(c)
+
+    def outside(i, inward):
+        p = c[i] + (c[i] - c[inward]) * 0.5                # centre of the outer square beyond corner i
+        r = max(2, int(0.15 * np.linalg.norm(c[i] - c[inward])))
+        x, y = int(round(p[0])), int(round(p[1]))
+        patch = gray[max(y - r, 0):y + r + 1, max(x - r, 0):x + r + 1]
+        return float(patch.mean()) if patch.size else 0.0
+    if outside(0, cols + 1) > outside(n - 1, n - 2 - cols):
+        return c[::-1].copy()
+    return c
+
+
+def estimate_camera(corners: np.ndarray, image_size, pattern=PATTERN, square_mm=25.0) -> CameraCalib:
+    """Intrinsics from ONE view of a flat board seen at an angle: only the focal length (principal point at the
+    image centre, square pixels, no lens distortion). Good to a fraction of a percent for a lens with little
+    distortion; calibrate_camera from many views is the accurate way, and only needed once per camera."""
+    w, h = image_size
+    K0 = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1.0]])
+    flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT | cv2.CALIB_FIX_ASPECT_RATIO
+             | cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3)
+    obj = object_points(pattern, square_mm).reshape(-1, 1, 3)
+    rms, K, dist, _, _ = cv2.calibrateCamera([obj], [corners.astype(np.float32).reshape(-1, 1, 2)], (w, h), K0,
+                                             np.zeros(5), flags=flags)
+    return CameraCalib(K, np.zeros(5), (w, h), float(rms))
+
+
+def stereo_from_table(corners_left, corners_right, left: CameraCalib, right: CameraCalib, pattern=PATTERN,
+                      square_mm=25.0, same_camera=False) -> tuple[StereoCalib, dict]:
+    """The whole session calibration from one view of a board lying flat on the table, seen by both cameras
+    (corners in canonical order, see canonical_corners). Each camera's pose against the board comes from its own
+    view; the stereo geometry follows from the two poses, so no stereo pairs are needed while the cameras stay put.
+
+    Table frame as in table_pose_from_pair. Returns (StereoCalib, check): check has each camera's reprojection
+    error (px) and how far the board's corners triangulate from where they are (mm, mean and max)."""
+    flip = np.diag([1.0, -1.0, -1.0, 1.0])
+    T_l = _pose(corners_left, left, pattern, square_mm)
+    flipped = float(T_l[:3, 2] @ (-T_l[:3, 3])) < 0     # board z must point towards the camera: z up
+    obj = object_points(pattern, square_mm)
+
+    def pose(corners, cam):
+        T = _pose(corners, cam, pattern, square_mm)
+        px = cv2.projectPoints(obj.reshape(-1, 1, 3), cv2.Rodrigues(T[:3, :3])[0], T[:3, 3], cam.K, cam.dist)[0]
+        return (T @ flip if flipped else T), _rms_px(px, corners)
+    T_l, err_l = pose(corners_left, left)
+    if same_camera:      # one camera for both views: no disparity; 1 mm stands in so rectification doesn't divide by 0
+        R, t, err_r = np.eye(3), np.array([-1.0, 0.0, 0.0]), err_l
+    else:
+        T_r, err_r = pose(corners_right, right)
+        R = T_r[:3, :3] @ T_l[:3, :3].T
+        t = T_r[:3, 3] - R @ T_l[:3, 3]
+    calib = StereoCalib(left, right, R, t, max(err_l, err_r), T_l, pattern, square_mm)
+    check = {"left_px": err_l, "right_px": err_r, "mean_mm": None, "max_mm": None}
+    if not same_camera:
+        X = calib.to_table(calib.triangulate(corners_left, corners_right))
+        truth = obj * ([1, -1, -1] if flipped else 1)
+        e = np.linalg.norm(X - truth, axis=1)
+        check |= {"mean_mm": float(e.mean()), "max_mm": float(e.max())}
+    return calib, check

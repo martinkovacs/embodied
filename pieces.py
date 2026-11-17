@@ -12,6 +12,8 @@ Usage:
     venv/bin/python pieces.py samples/pieces_01.jpg --radius-px 60
 """
 import argparse
+import copy
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,13 +23,34 @@ import numpy as np
 PIECE_D_MM = 35.0
 PIECE_H_MM = 30.0
 
-# HSV ranges, OpenCV convention (H 0..179). Red wraps around 0.
+# HSV thresholds, OpenCV convention (H 0..179): hue range [lo, hi), minimum saturation and value. A negative lo
+# wraps around 0 (red: -10 = 170). The navy blue pieces' tops lose saturation where the light hits them (S ~100 on
+# a bright top, 150-200 elsewhere), hence blue's lower S floor; nothing grey on the table comes near hue 100-135.
 COLORS = {
-    "red": {"h": [(0, 10), (170, 180)], "s": (100, 255), "v": (40, 255)},
-    "blue": {"h": [(100, 135)], "s": (100, 255), "v": (20, 255)},
-    "green": {"h": [(40, 90)], "s": (50, 255), "v": (40, 255)},
+    "red": {"h": (-10, 10), "s": 100, "v": 40},
+    "blue": {"h": (100, 135), "s": 60, "v": 20},
+    "green": {"h": (40, 90), "s": 50, "v": 40},
 }
+# Everything the detection GUI can tune. min_fill: share of the top disk that must have the colour; min_rim: share
+# of the rim that must have an edge. Lower = more sensitive (more pieces found, and more false ones).
+DEFAULT_PARAMS = {"colors": COLORS, "min_fill": 0.55, "min_rim": 0.6}
 DRAW = {"red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0)}
+
+
+def load_params(path=None):
+    """Detection parameters: the defaults, overridden by what the calibration GUI saved to path (if it exists)."""
+    params = copy.deepcopy(DEFAULT_PARAMS)
+    if path is not None and Path(path).exists():
+        saved = json.loads(Path(path).read_text())
+        for name, c in saved.get("colors", {}).items():
+            if name in params["colors"]:
+                params["colors"][name] |= {k: tuple(v) if k == "h" else v for k, v in c.items() if k in ("h", "s", "v")}
+        params |= {k: float(saved[k]) for k in ("min_fill", "min_rim") if k in saved}
+    return params
+
+
+def save_params(path, params):
+    Path(path).write_text(json.dumps(params, indent=2))
 
 
 @dataclass
@@ -48,6 +71,7 @@ class TopView:
         self.rvec, _ = cv2.Rodrigues(np.asarray(T_cam_table, float)[:3, :3])
         self.tvec = np.asarray(T_cam_table, float)[:3, 3]
         self.T = np.asarray(T_cam_table, float)
+        self.cam_c = -self.T[:3, :3].T @ self.tvec  # camera centre in the table frame
         x0, x1, y0, y1 = bounds or self.visible_bounds(image_size)
         self.x0, self.y1 = x0, y1
         xs = np.arange(x0, x1, 1 / ppm)
@@ -80,17 +104,59 @@ class TopView:
     def view_to_table(self, u, v):
         return self.x0 + u / self.ppm, self.y1 - v / self.ppm
 
+    def smear(self, u, v):
+        """Where a piece whose top face is centred at view (u, v) smears its side, in view px: the vector from the
+        top centre to the bottom centre, seen from the camera along its ray onto the top-face plane. The camera sees
+        the side facing it, so in the top view the side lies on the camera's side of the top face, as a band of the
+        piece's colour this long; an oblique camera makes it longer than a radius."""
+        x, y = self.view_to_table(u, v)
+        c = self.cam_c
+        k = (c[2] - self.z) / (c[2] - (self.z - PIECE_H_MM))
+        bx, by = c[0] + (x - c[0]) * k, c[1] + (y - c[1]) * k
+        return (bx - x) * self.ppm, -(by - y) * self.ppm
+
 
 def color_masks(bgr, colors=COLORS):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     H, S, V = cv2.split(hsv)
     out = {}
     for name, c in colors.items():
-        hm = np.zeros(H.shape, bool)
-        for lo, hi in c["h"]:
-            hm |= (H >= lo) & (H < hi)
-        out[name] = hm & (S >= c["s"][0]) & (S <= c["s"][1]) & (V >= c["v"][0]) & (V <= c["v"][1])
+        lo, hi = c["h"]
+        hm = (H >= lo % 180) | (H < hi) if lo < 0 else (H >= lo) & (H < hi)
+        out[name] = hm & (S >= c["s"]) & (V >= c["v"])
     return out
+
+
+def mask_view(bgr, params, color):
+    """The image dimmed to grey except the pixels that pass color's thresholds: shows what the detector sees."""
+    m = color_masks(bgr, {color: params["colors"][color]})[color]
+    grey = cv2.cvtColor(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR) // 3
+    grey[m] = bgr[m]
+    return grey
+
+
+def same_piece(a, b, r_px, smear):
+    """Are the candidates a, b ((color, x, y, ...), view px) the same piece? Closer than 1.4 r (touching pieces
+    are 2 r apart), or of one colour with b in a's side band (smear: see TopView.smear), which an oblique camera
+    stretches past 1.4 r: up to its end plus a little, and no wider than the piece."""
+    d = np.subtract(b[1:3], a[1:3])
+    if np.hypot(*d) < 1.4 * r_px:
+        return True
+    if smear is None or a[0] != b[0]:
+        return False
+    s = np.asarray(smear(*a[1:3]), float)
+    n = np.hypot(*s)
+    if n < 1e-6:
+        return False
+    along = d @ s / n
+    return abs(along) < n + 0.5 * r_px and np.hypot(*(d - along * s / n)) < 0.5 * r_px
+
+
+def toward_camera(a, b, smear):
+    """How far b lies from a towards the camera, along a's side band (negative: away from it)."""
+    s = np.asarray(smear(*a), float)
+    n = np.hypot(*s)
+    return 0.0 if n < 1e-6 else float(np.subtract(b, a) @ s / n)
 
 
 def _disk(r):
@@ -98,8 +164,35 @@ def _disk(r):
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
 
 
-def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=None):
-    """Find top-face circles of radius r_px. Returns [(color, u, v, rim, fill)]."""
+def rim_votes(gx, gy, mag, edge_thr, r_px, min_rim):
+    """Circle centres voted for by the colour edges: every strong edge pixel votes r away along its gradient, both
+    ways. The grey Hough above misses rims with little brightness contrast (dark blue on its own side), and the
+    colour peaks give nothing inside a group of same-coloured pieces, where the colour fill is one flat plateau."""
+    h, w = mag.shape
+    ys, xs = np.nonzero(mag > edge_thr)
+    if len(xs) == 0:
+        return []
+    m = mag[ys, xs]
+    ux, uy = gx[ys, xs] / m, gy[ys, xs] / m
+    acc = np.zeros(h * w, np.float32)
+    for sign in (1, -1):
+        cx, cy = np.round(xs + sign * r_px * ux).astype(int), np.round(ys + sign * r_px * uy).astype(int)
+        ok = (cx >= 0) & (cx < w) & (cy >= 0) & (cy < h)
+        acc += np.bincount(cy[ok] * w + cx[ok], minlength=h * w).astype(np.float32)
+    acc = acc.reshape(h, w)
+    acc = cv2.GaussianBlur(acc, (0, 0), max(r_px / 10, 1.0))
+    # a full rim gives ~2 pi r votes, spread by the blur: ask for a fraction of what a rim passing min_rim would give
+    need = 0.5 * min_rim * 2 * np.pi * r_px / (2 * np.pi * max(r_px / 10, 1.0) ** 2)
+    peaks = ((acc >= cv2.dilate(acc, _disk(0.5 * r_px))) & (acc >= need)).astype(np.uint8)
+    _, _, _, centroids = cv2.connectedComponentsWithStats(peaks)
+    return [tuple(c) for c in centroids[1:]]
+
+
+def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=None, smear=None):
+    """Find top-face circles of radius r_px. Returns [(color, u, v, rim, fill)].
+
+    smear(u, v) -> (du, dv): where a piece's side shows in this image (TopView.smear). Without it, a candidate on
+    the side of a piece seen at an angle can survive as a second detection of the same piece."""
     sigma = max(r_px / 25, 1.0)
     gray = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (0, 0), sigma)
     # Colour gradient: per pixel, the BGR channel with the strongest gradient. Grey alone misses
@@ -132,6 +225,10 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
                                minRadius=int(r_px * 0.9), maxRadius=int(np.ceil(r_px * 1.1)))
     if circles is not None:
         cands += [(float(x), float(y)) for x, y, _ in circles[0]]
+    cands += rim_votes(gx, gy, mag, edge_thr, r_px, min_rim)
+    # candidates this close end up at the same top face after the grid search: refine one of them
+    cell = max(r_px / 3, 1.0)
+    cands = list({(round(x / cell), round(y / cell)): (x, y) for x, y in cands}.values())
 
     # Score = rim * fill * brightness. Rim: on how many of 72 rays around the circle there is an edge
     # with a radial gradient. Each candidate is refined by a grid search within +-r, because Hough and
@@ -170,47 +267,61 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
         if s[k] > 0:
             results.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(br[k])))
 
-    # Non-max suppression: touching pieces are 2r apart, duplicates (e.g. on a piece's side) are closer.
-    results.sort(key=lambda r: r[3] * r[4] * r[5], reverse=True)
+    # Non-max suppression, best score first: one detection per piece. A candidate on the same piece as a kept one
+    # (same_piece) is dropped, unless it lies further from the camera along the side band and scores at least half
+    # as well: then the kept one was on the side and this one is the top face, which replaces it.
+    def sc(r):
+        return r[3] * r[4] * r[5]
+    results.sort(key=sc, reverse=True)
     kept = []
     for r in results:
-        if all(np.hypot(r[1] - k[1], r[2] - k[2]) > 1.4 * r_px for k in kept):
+        dup = [i for i, k in enumerate(kept) if same_piece(k, r, r_px, smear)]
+        if not dup:
             kept.append(r)
+        elif len(dup) == 1 and smear is not None:
+            k = kept[dup[0]]
+            if toward_camera(k[1:3], r[1:3], smear) < -0.3 * r_px and sc(r) >= 0.5 * sc(k):
+                kept[dup[0]] = r
     return [r[:5] for r in kept]
 
 
-def detect_pieces(img, view: TopView | None = None, radius_px=None, colors=COLORS):
-    """Detect pieces in a camera image. With a TopView, positions are also returned in table mm."""
+def detect_pieces(img, view: TopView | None = None, radius_px=None, params=None):
+    """Detect pieces in a camera image. With a TopView, positions are also returned in table mm.
+    params: load_params(); the defaults if None."""
+    p = params or DEFAULT_PARAMS
+    kw = dict(colors=p["colors"], min_rim=p["min_rim"], min_fill=p["min_fill"])
     if view is None:
-        return [Piece(c, (u, v), (u, v), None, rim, fill) for c, u, v, rim, fill in detect(img, radius_px, colors)]
+        return [Piece(c, (u, v), (u, v), None, rim, fill) for c, u, v, rim, fill in detect(img, radius_px, **kw)]
     top = view.warp(img)
     pieces = []
-    for c, u, v, rim, fill in detect(top, PIECE_D_MM / 2 * view.ppm, colors):
+    for c, u, v, rim, fill in detect(top, PIECE_D_MM / 2 * view.ppm, smear=view.smear, **kw):
         x, y = view.view_to_table(u, v)
         iu, iv = view.project([[x, y, view.z]])[0]
         pieces.append(Piece(c, (u, v), (float(iu), float(iv)), (x, y, view.z), rim, fill))
     return pieces
 
 
-def draw(img, pieces, view: TopView | None = None, radius_px=None):
-    """Draw top-face outlines + bounding boxes on the original image."""
+def draw(img, pieces, view: TopView | None = None, radius_px=None, lone=()):
+    """Draw top-face outlines + bounding boxes on the original image. Pieces in lone (seen by this camera only,
+    which is where false detections come from) are drawn thin and grey, with a "?"."""
     vis = img.copy()
     ang = np.linspace(0, 2 * np.pi, 48, endpoint=False)
     for p in pieces:
-        col = DRAW[p.color]
+        alone = any(p is q for q in lone)
+        col = (150, 150, 150) if alone else DRAW[p.color]
         if view is not None:
             r = PIECE_D_MM / 2
             x, y, z = p.table_mm
             top = view.project(np.c_[x + r * np.cos(ang), y + r * np.sin(ang), np.full(48, z)])
             bottom = view.project(np.c_[x + r * np.cos(ang), y + r * np.sin(ang), np.full(48, z - PIECE_H_MM)])
             bx, by, bw, bh = cv2.boundingRect(np.vstack([top, bottom]).astype(np.float32))
-            cv2.polylines(vis, [top.round().astype(np.int32)], True, col, 2, cv2.LINE_AA)
-            label = f"{p.color} ({x:.0f}, {y:.0f})"
+            cv2.polylines(vis, [top.round().astype(np.int32)], True, col, 1 if alone else 2, cv2.LINE_AA)
+            label = f"{p.color} ({x:.0f}, {y:.0f})" + (" ?" if alone else "")
         else:
             u, v = p.image_uv
             bx, by, bw, bh = int(u - radius_px), int(v - radius_px), int(2 * radius_px), int(2 * radius_px)
             label = p.color
-        cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), col, 2)
+        cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), col, 1 if alone else 2)
         cv2.circle(vis, tuple(int(round(c)) for c in p.image_uv), 3, col, -1)
         cv2.putText(vis, label, (bx, max(by - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(vis, label, (bx, max(by - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
@@ -238,8 +349,12 @@ def view_from_calib(calib, camera="left", table_offset_mm=0.0, ppm=2.0):
     return TopView(cam.K, cam.dist, T, z_mm=PIECE_H_MM - table_offset_mm, ppm=ppm, image_size=cam.image_size)
 
 
-def matched_pieces(calib, left_pieces, right_pieces, max_mm=15.0):
+def matched_pieces(calib, left_pieces, right_pieces, max_mm=15.0, max_dz=0.6 * PIECE_H_MM):
     """Pair left/right detections (same colour, close on the table) and triangulate their top centres.
+
+    A pair must also triangulate near the top-face height (max_dz; 1 px of disparity is ~2.5 mm of height at 65 cm
+    with a 15 cm baseline, so not tighter): a top face does, while a detection on a
+    piece's side (each camera sees its own side) lands lower, so two side detections never pass for a piece.
 
     Returns [(left Piece, table xyz or None)]: the stereo position as an (x, y, z) ndarray in table
     mm, None for a left detection with no right partner.
@@ -250,12 +365,13 @@ def matched_pieces(calib, left_pieces, right_pieces, max_mm=15.0):
         for j, q in enumerate(right_pieces):
             d = np.hypot(p.table_mm[0] - q.table_mm[0], p.table_mm[1] - q.table_mm[1])
             if q.color == p.color and j not in used and d < max_mm and (best is None or d < best[1]):
-                best = (j, d)
+                X = calib.to_table(calib.triangulate(np.array([p.image_uv]), np.array([q.image_uv])))[0]
+                if abs(X[2] - p.table_mm[2]) < max_dz:
+                    best = (j, d, X)
         stereo = None
         if best is not None:
             used.add(best[0])
-            X = calib.triangulate(np.array([p.image_uv]), np.array([right_pieces[best[0]].image_uv]))
-            stereo = calib.to_table(X)[0]
+            stereo = best[2]
         rows.append((p, stereo))
     return rows
 
@@ -267,6 +383,7 @@ def main():
     ap.add_argument("--camera", default="left", choices=["left", "right"])
     ap.add_argument("--table-offset-mm", type=float, default=0.0, help="board thickness if the table pose was taken on a board")
     ap.add_argument("--radius-px", type=float, help="top-face radius in pixels (uncalibrated mode)")
+    ap.add_argument("--params", help="detection thresholds as saved by the calibration GUI (calib_data/detection.json)")
     ap.add_argument("--out", default="detections")
     ap.add_argument("--show", action="store_true")
     args = ap.parse_args()
@@ -274,11 +391,12 @@ def main():
         ap.error("give --calib or --radius-px")
 
     view = view_from_calib(args.calib, args.camera, args.table_offset_mm) if args.calib else None
+    params = load_params(args.params)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     for path in map(Path, args.images):
         img = cv2.imread(str(path))
-        pieces = detect_pieces(img, view, args.radius_px)
+        pieces = detect_pieces(img, view, args.radius_px, params)
         counts = {c: sum(p.color == c for p in pieces) for c in COLORS}
         print(f"{path.name}: " + ", ".join(f"{c}={n}" for c, n in counts.items()))
         for p in pieces:

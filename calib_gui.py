@@ -1,7 +1,11 @@
-"""Stereo calibration GUI for the two-camera piece-picking setup (NiceGUI).
+"""Calibration GUI for the two-camera piece-picking setup (NiceGUI).
 
-Steps (tabs): 1 Setup -> 2 Stereo calibration (capture checkerboard pairs, calibrate, check rectification)
--> 3 Table pose (board flat on the table) -> 4 3D view + live piece detection.
+Steps (tabs): 1 Setup -> 2 Lens (once per camera: checkerboard views, kept across sessions) -> 3 Table pose (the one
+step per session: the board flat on the table, one photo gives both cameras' poses and the stereo geometry)
+-> 4 3D view + live piece detection, with the colour thresholds to tune (saved for the runner).
+
+Without a lens calibration the table photo also estimates each camera's focal length (no distortion): fine to try
+things out, but calibrate the lenses once for the real thing.
 
 Sources are two cameras, or in test mode image files that stand in for them: one left/right set per step
 (calibration pairs, table pose, detection scene), defaulting to the Blender renders in synthetic/.
@@ -18,6 +22,8 @@ Run:  venv/bin/python calib_gui.py             (opens its own app window, dark m
 """
 import base64
 import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import shutil
 import subprocess
 import sys
@@ -33,7 +39,8 @@ from nicegui import app, run, ui
 
 import pieces
 import stereo_calib as sc
-from cameras import BASLER, DATA, SETTINGS_PATH, STAGES, TEST_DATA, TEST_FILES, Source, list_cameras, load_settings
+from cameras import (BASLER, DATA, LENS_FILE, SETTINGS_PATH, STAGES, TEST_DATA, TEST_FILES, Source, list_cameras,
+                     load_settings)
 
 PREVIEW_W = 640
 PORT = 8080
@@ -43,12 +50,12 @@ HEX = {"red": "#e53935", "blue": "#1e40af", "green": "#2e9d4f"}
 
 @dataclass
 class Pair:
+    """One capture for the lens calibration: the board's corners in each camera, None where it wasn't seen."""
     name: str
-    left: np.ndarray
-    right: np.ndarray
+    left: np.ndarray | None
+    right: np.ndarray | None
     err_l: float | None = None
     err_r: float | None = None
-    err_stereo: float | None = None
 
 
 class State:
@@ -63,6 +70,28 @@ class State:
         self.rect_maps = None
         self.views = None  # (TopView left, TopView right) for detection
         self.last_auto = 0.0
+        self.lens = {}     # camera key -> saved lens calibration (lens.json)
+        self.params = pieces.load_params()
+
+    def lens_key(self, side):
+        """Lens calibrations belong to a camera, not to a side: swapping the cameras keeps each one's."""
+        return f"test:{side}" if self.settings["test_mode"] else str(self.settings[side])
+
+    def lens_for(self, side, size):
+        e = self.lens.get(self.lens_key(side))
+        if e is None or tuple(e["image_size"]) != tuple(size):
+            return None
+        return sc.CameraCalib(np.array(e["K"]), np.array(e["dist"]), tuple(e["image_size"]), e["rms"])
+
+    def save_lens(self, side, cam, views):
+        self.lens[self.lens_key(side)] = {"K": np.asarray(cam.K).tolist(), "dist": np.ravel(cam.dist).tolist(),
+                                          "image_size": list(cam.image_size), "rms": cam.rms, "views": views,
+                                          "saved": datetime.now().isoformat(timespec="minutes")}
+        (self.data / LENS_FILE).write_text(json.dumps(self.lens, indent=2))
+
+    @property
+    def params_path(self):
+        return self.data / "detection.json"
 
     @property
     def data(self):
@@ -81,6 +110,8 @@ class State:
         self.loaded = self.data
         self.rect_maps = self.views = None
         self.calib = sc.StereoCalib.load(self.data / "calib.json") if (self.data / "calib.json").exists() else None
+        self.lens = json.loads((self.data / LENS_FILE).read_text()) if (self.data / LENS_FILE).exists() else {}
+        self.params = pieces.load_params(self.params_path)
         load_saved_pairs()
         if self.calib is not None and self.calib.T_left_table is not None:
             self.save_calib()  # builds the detection views
@@ -201,8 +232,9 @@ def rectified_pair(left, right):
 # ---------- workers (run in a thread) ----------
 
 def capture_pair(left, right):
+    """The board needs to be in one camera only: each lens is calibrated on its own."""
     cl, cr = sc.find_corners(left, S.pattern), sc.find_corners(right, S.pattern)
-    if cl is None or cr is None:
+    if cl is None and cr is None:
         return None
     name = f"{int(time.time() * 1000) % 10**9:09d}"
     cv2.imwrite(str(S.pairs_dir / f"{name}_left.png"), left)
@@ -232,56 +264,94 @@ def load_saved_pairs():
         if right is None:
             continue
         cl, cr = sc.find_corners(left, S.pattern), sc.find_corners(right, S.pattern)
-        if cl is not None and cr is not None:
+        if cl is not None or cr is not None:
             S.pairs.append(Pair(name, cl, cr))
             S.image_size = (left.shape[1], left.shape[0])
 
 
-def calibrate_one_camera():
-    """Both "cameras" are the same one. 1 mm stands in for the baseline only so rectification doesn't divide by zero."""
-    cam, errs = sc.calibrate_camera([p.left for p in S.pairs], S.image_size, S.pattern, S.square)
-    for p, e in zip(S.pairs, errs):
-        p.err_l = p.err_r = p.err_stereo = e
-    table = S.calib.T_left_table if S.calib is not None else None
-    S.calib = sc.StereoCalib(cam, cam, np.eye(3), np.array([-1.0, 0.0, 0.0]), cam.rms, table, S.pattern, S.square)
-    S.save_calib()
+def one_camera():
+    return S.settings["one_camera"] and not S.settings["test_mode"]
 
 
-def calibrate():
-    if S.settings["one_camera"] and not S.settings["test_mode"]:
-        return calibrate_one_camera()
-    pat, sq = S.pattern, S.square
-    left, errs_l = sc.calibrate_camera([p.left for p in S.pairs], S.image_size, pat, sq)
-    right, errs_r = sc.calibrate_camera([p.right for p in S.pairs], S.image_size, pat, sq)
-    stereo, errs_s = sc.calibrate_stereo([p.left for p in S.pairs], [p.right for p in S.pairs], left, right, pat, sq)
-    for p, el, er, es in zip(S.pairs, errs_l, errs_r, errs_s):
-        p.err_l, p.err_r, p.err_stereo = el, er, es
-    if S.calib is not None and S.calib.T_left_table is not None:
-        stereo.T_left_table = S.calib.T_left_table  # keep the old table pose; recapture it for best accuracy
-    S.calib = stereo
-    S.save_calib()
+def calibrate_lens():
+    """Each camera's lens from the views it saw the board in; saved for this camera, for every later session.
+    Returns {side: (rms, views)}. The table pose, if captured, is recomputed with the new lenses."""
+    out = {}
+    for side in ("left",) if one_camera() else ("left", "right"):
+        views = [p for p in S.pairs if getattr(p, side) is not None]
+        if len(views) < 5:
+            continue
+        cam, errs = sc.calibrate_camera([getattr(p, side) for p in views], S.image_size, S.pattern, S.square)
+        for p, e in zip(views, errs):
+            setattr(p, "err_l" if side == "left" else "err_r", e)
+        S.save_lens(side, cam, len(views))
+        out[side] = (cam.rms, len(views))
+    tl, tr = S.data / "table_left.png", S.data / "table_right.png"
+    if out and tl.exists() and tr.exists():
+        capture_table(cv2.imread(str(tl)), cv2.imread(str(tr)), save_images=False)
+    return out
 
 
-def capture_table(left, right):
-    cl, cr = sc.find_corners(left, S.pattern), sc.find_corners(right, S.pattern)
+def capture_table(left, right, save_images=True):
+    """The session calibration from one photo of the board flat on the table (stereo_calib.stereo_from_table).
+    Returns None if a camera doesn't see the board, else (check, lens) with lens: side -> "saved" / "estimated"."""
+    same = left is right or one_camera()
+    cl = sc.find_corners(left, S.pattern)
+    cr = cl if same else sc.find_corners(right, S.pattern)
     if cl is None or cr is None:
         return None
-    T, rms = sc.table_pose_from_pair(cl, cr, S.calib, S.pattern, S.square)
-    S.calib.T_left_table = T
+    cl = sc.canonical_corners(left, cl, S.pattern)
+    cr = cl if same else sc.canonical_corners(right, cr, S.pattern)
+    cams, lens = [], {}
+    for side, img, c in (("left", left, cl), ("right", right, cr)):
+        size = (img.shape[1], img.shape[0])
+        cam = S.lens_for("left" if same else side, size)
+        lens[side] = "saved" if cam is not None else "estimated"
+        cams.append(cam if cam is not None else sc.estimate_camera(c, size, S.pattern, S.square))
+    if same:
+        cams[1] = cams[0]
+    S.calib, check = sc.stereo_from_table(cl, cr, *cams, S.pattern, S.square, same_camera=same)
+    S.calib.cameras = None if S.settings["test_mode"] else {"left": S.settings["left"], "right": S.settings["right"]}
     S.save_calib()
-    cv2.imwrite(str(S.data / "table_left.png"), left)
-    cv2.imwrite(str(S.data / "table_right.png"), right)
-    return rms
+    if save_images:
+        cv2.imwrite(str(S.data / "table_left.png"), left)
+        cv2.imwrite(str(S.data / "table_right.png"), right)
+    return check, lens
 
 
-def detect_both(left, right):
+def table_text(check, lens):
+    lines = [f"Lens: left {lens['left']}, right {lens['right']}"
+             + (" (estimated from this photo, no distortion: calibrate the lenses once for full accuracy)"
+                if "estimated" in lens.values() else ""),
+             f"Board reprojection: left {check['left_px']:.2f} px, right {check['right_px']:.2f} px"]
+    if check["mean_mm"] is not None:
+        lines.append(f"Stereo check, board corners: {check['mean_mm']:.2f} mm mean, {check['max_mm']:.2f} mm max "
+                     f"· baseline {S.calib.baseline_mm:.0f} mm")
+    return "\n".join(lines + camera_pose_text().split(" · "))
+
+
+def detect_both(left, right, mask_color=None):
+    """Both cameras' detections, paired. Pieces only one camera sees are drawn grey with a "?": the runner ignores
+    them (that's where false detections come from)."""
     vl, vr = S.views
-    pl, pr = pieces.detect_pieces(left, vl), pieces.detect_pieces(right, vr)
-    if S.settings["one_camera"] and not S.settings["test_mode"]:   # no disparity to triangulate from: the table plane
-        matched = [(p, np.array(p.table_mm)) for p in pl]
+    params = S.params
+    if one_camera():   # one camera: one detection, and no disparity to triangulate from: the table plane
+        pl = pieces.detect_pieces(left, vl, params=params)
+        pr, matched = pl, [(p, np.array(p.table_mm)) for p in pl]
     else:
+        with ThreadPoolExecutor(2) as pool:
+            pl, pr = pool.map(lambda iv: pieces.detect_pieces(iv[0], iv[1], params=params), ((left, vl), (right, vr)))
         matched = pieces.matched_pieces(S.calib, pl, pr)
-    return pl, pr, pieces.draw(left, pl, vl), pieces.draw(right, pr, vr), matched
+    lone_l = [p for p, st in matched if st is None]
+    paired_r = set()
+    for p, st in matched:
+        if st is not None:   # the right detection it was paired with: same colour, nearest on the table
+            paired_r.add(min((q for q in pr if q.color == p.color),
+                             key=lambda q: np.hypot(q.table_mm[0] - p.table_mm[0], q.table_mm[1] - p.table_mm[1])).table_mm)
+    lone_r = [q for q in pr if q.table_mm not in paired_r] if not one_camera() else []
+    if mask_color:
+        left, right = pieces.mask_view(left, params, mask_color), pieces.mask_view(right, params, mask_color)
+    return pl, pr, pieces.draw(left, pl, vl, lone=lone_l), pieces.draw(right, pr, vr, lone=lone_r), matched
 
 
 # ---------- UI ----------
@@ -342,12 +412,11 @@ def root():
         left, right = S.pair(view["stage"])
         prefix = f"test · {STAGES[view['stage']]} · " if S.settings["test_mode"] else ""
         status["src"].text = "" if left is None else f"{prefix}L: {left.label()}   R: {right.label()}"
-        if S.calib is not None:
-            status["chip_cal"].text = f"RMS {S.calib.rms:.2f}px · baseline {S.calib.baseline_mm:.1f} mm"
-            status["chip_cal"].props("color=positive text-color=white")
-        else:
-            status["chip_cal"].text = "not calibrated"
-            status["chip_cal"].props("color=grey text-color=white")
+        sides = ("left",) if one_camera() else ("left", "right")
+        have = [S.lens_key(sd) in S.lens for sd in sides]
+        status["chip_cal"].text = "lens: saved" if all(have) else "lens: saved for one camera" if any(have) \
+            else "lens: estimated from the table photo"
+        status["chip_cal"].props(f"color={'positive' if all(have) else 'grey'} text-color=white")
         has_table = S.calib is not None and S.calib.T_left_table is not None
         status["chip_table"].text = "table pose ✓" if has_table else "no table pose"
         status["chip_table"].props(f"color={'positive' if has_table else 'grey'} text-color=white")
@@ -365,7 +434,7 @@ def root():
 
     with ui.tabs().classes("w-full") as tabs:
         t_setup = ui.tab("1 · Setup")
-        t_stereo = ui.tab("2 · Stereo")
+        t_stereo = ui.tab("2 · Lens (once)")
         t_table = ui.tab("3 · Table pose")
         t_3d = ui.tab("4 · 3D & detection")
 
@@ -390,8 +459,15 @@ def root():
                         ui.button("Use the Basler cameras", icon="photo_camera", on_click=use_basler).props("outline dense")
                         ui.switch("One camera (testing only): uses the left camera for both views") \
                             .bind_value(S.settings, "one_camera")
-                        with ui.row().classes("w-full"):
+                        async def swap():
+                            S.settings["left"], S.settings["right"] = S.settings["right"], S.settings["left"]
+                            if S.sources and not S.settings["test_mode"]:
+                                await do_connect()
+                            ui.notify("Cameras swapped" + (": capture the table pose again" if S.calib is not None else ""))
+                        with ui.row().classes("w-full items-center no-wrap"):
                             ui.input("Left camera").bind_value(S.settings, "left").classes("flex-1")
+                            ui.button(icon="swap_horiz", on_click=swap).props("flat round") \
+                                .tooltip("Swap the left and right camera")
                             ui.input("Right camera").bind_value(S.settings, "right").classes("flex-1")
                         with ui.row():
                             ui.number("Width", format="%d").bind_value(S.settings, "width").classes("w-28")
@@ -445,7 +521,7 @@ def root():
                         .classes("text-sm text-amber-400")
                     ui.label("Board thickness: the board lies on the table for the table pose, so the pieces stand this "
                              "much lower than the board surface.").classes("text-sm opacity-70")
-            next_button(t_stereo, "Stereo calibration", lambda: bool(S.sources), "Connect the sources first")
+            next_button(t_table, "Table pose", lambda: bool(S.sources), "Connect the sources first")
 
         # ---- 2 Stereo ----
         with ui.tab_panel(t_stereo):
@@ -466,9 +542,10 @@ def root():
                     with ui.row().classes("items-center gap-4"):
                         st_found = ui.label().classes("text-sm")
                         rect_sw = ui.switch("Show rectified").tooltip("After calibration: matching points must lie on the same yellow line")
-                    ui.label("Move the board through the whole view of both cameras: near/far, tilted ~30° in different "
-                             "directions, corners of the image too. 15-30 pairs are plenty. Green = coverage so far.") \
-                        .classes("text-sm opacity-70")
+                    ui.label("Once per camera, kept across sessions (moving a camera doesn't change its lens; refocusing "
+                             "or another resolution does). Move the board through each camera's view: near/far, tilted "
+                             "~30° in different directions, corners of the image too. One camera at a time is fine. "
+                             "15-25 views per camera. Green = coverage so far.").classes("text-sm opacity-70")
                 with ui.card().classes("flex-1 min-w-0 self-stretch"):
                     with ui.row().classes("items-center w-full"):
                         pairs_title = ui.label().classes("font-medium")
@@ -476,15 +553,15 @@ def root():
                         btn_clear = ui.button(icon="delete_sweep").props("flat dense color=negative").tooltip("Delete all pairs")
                     pairs_list = ui.column().classes("w-full gap-0 overflow-auto max-h-[calc(100vh-420px)]")
                     ui.space()
-                    btn_calib = ui.button("Calibrate", icon="tune").classes("w-full")
-                    next_button(t_table, "Table pose", lambda: S.calib is not None, "Calibrate first")
+                    btn_calib = ui.button("Calibrate lenses", icon="tune").classes("w-full")
+                    next_button(t_table, "Table pose", lambda: True, "")
             with ui.card().classes("w-full"):
                 ui.label("Result").classes("font-medium")
                 result_md = ui.markdown("Not calibrated yet.")
                 err_chart = ui.echart({
-                    "tooltip": {"trigger": "axis"}, "legend": {"data": ["left", "right", "stereo"]},
+                    "tooltip": {"trigger": "axis"}, "legend": {"data": ["left", "right"]},
                     "xAxis": {"type": "category", "data": []}, "yAxis": {"type": "value", "name": "px"},
-                    "series": [{"name": n, "type": "bar", "data": []} for n in ("left", "right", "stereo")],
+                    "series": [{"name": n, "type": "bar", "data": []} for n in ("left", "right")],
                 }).classes("w-full h-64")
 
             def refresh_pairs():
@@ -494,32 +571,29 @@ def root():
                     for i, p in enumerate(S.pairs):
                         with ui.row().classes("items-center w-full no-wrap text-sm min-h-[30px]"):
                             ui.label(f"#{i + 1}").classes("w-8")
-                            errs = "" if p.err_stereo is None else f"L {p.err_l:.2f} · R {p.err_r:.2f} · stereo {p.err_stereo:.2f} px"
-                            bad = p.err_stereo is not None and p.err_stereo > 1.0
+                            fmt = lambda c, e: "–" if c is None else "✓" if e is None else f"{e:.2f} px"
+                            errs = f"L {fmt(p.left, p.err_l)} · R {fmt(p.right, p.err_r)}"
+                            bad = max(p.err_l or 0, p.err_r or 0) > 1.0
                             ui.label(errs).classes("flex-1" + (" text-red-400" if bad else ""))
                             ui.button(icon="close", on_click=lambda p=p: delete_pair(p)).props("flat dense size=sm")
-                if S.pairs and S.pairs[0].err_stereo is not None:
+                if any(p.err_l is not None or p.err_r is not None for p in S.pairs):
                     err_chart.options["xAxis"]["data"] = [f"#{i + 1}" for i in range(len(S.pairs))]
-                    for s, key in zip(err_chart.options["series"], ("err_l", "err_r", "err_stereo")):
+                    for s, key in zip(err_chart.options["series"], ("err_l", "err_r")):
                         s["data"] = [round(getattr(p, key) or 0, 3) for p in S.pairs]
                     err_chart.update()
                 refresh_result()
 
             def refresh_result():
-                c = S.calib
-                if c is None:
-                    return
-                def cam_row(name, cam):
-                    K, d = np.asarray(cam.K), np.ravel(cam.dist)
-                    return f"| {name} | {K[0, 0]:.1f} | {K[1, 1]:.1f} | {K[0, 2]:.1f} | {K[1, 2]:.1f} | {cam.rms:.3f} | {', '.join(f'{x:.3f}' for x in d[:5])} |"
-                angle = np.degrees(np.linalg.norm(cv2.Rodrigues(np.asarray(c.R))[0]))
-                quality = "good" if c.rms < 0.5 else "ok" if c.rms < 1.0 else "poor: remove the worst pairs and recalibrate"
-                result_md.content = "\n".join([
-                    "| camera | fx | fy | cx | cy | RMS px | distortion |", "|---|---|---|---|---|---|---|",
-                    cam_row("left", c.left), cam_row("right", c.right), "",
-                    f"**Stereo RMS:** {c.rms:.3f} px ({quality})  ",
-                    f"**Baseline:** {c.baseline_mm:.1f} mm · **angle between cameras:** {angle:.1f}°",
-                ])
+                rows = ["| camera | fx | fy | cx | cy | RMS px | views | saved | distortion |", "|---|---|---|---|---|---|---|---|---|"]
+                for side in ("left", "right"):
+                    e = S.lens.get(S.lens_key(side))
+                    if e is None:
+                        rows.append(f"| {side} ({S.lens_key(side)}) | not calibrated: the table photo estimates it |||||||")
+                        continue
+                    K, d = np.asarray(e["K"]), np.ravel(e["dist"])
+                    rows.append(f"| {side} ({S.lens_key(side)}) | {K[0, 0]:.1f} | {K[1, 1]:.1f} | {K[0, 2]:.1f} | {K[1, 2]:.1f} "
+                                f"| {e['rms']:.3f} | {e['views']} | {e['saved']} | {', '.join(f'{x:.3f}' for x in d[:5])} |")
+                result_md.content = "\n".join(rows + ["", "Good: RMS under 0.5 px."])
 
             def delete_pair(p):
                 S.pairs.remove(p)
@@ -539,7 +613,7 @@ def root():
                 p = await run.io_bound(capture_pair, left, right)
                 if p is None:
                     if not quiet:
-                        ui.notify("Board not found in both images", type="warning")
+                            ui.notify("Board not found in either image", type="warning")
                     return
                 S.pairs.append(p)
                 refresh_pairs()
@@ -557,13 +631,14 @@ def root():
                 refresh_pairs()
 
             async def do_calibrate():
-                if len(S.pairs) < 5:
-                    ui.notify("Capture at least 5 pairs (15+ recommended)", type="warning")
-                    return
                 n = ui.notification("Calibrating...", spinner=True, timeout=None)
                 try:
-                    await run.io_bound(calibrate)
-                    ui.notify(f"Calibrated: stereo RMS {S.calib.rms:.3f} px, baseline {S.calib.baseline_mm:.1f} mm", type="positive")
+                    out = await run.io_bound(calibrate_lens)
+                    if not out:
+                        ui.notify("Each camera needs at least 5 views of the board (15+ recommended)", type="warning")
+                    else:
+                        ui.notify("Lens saved: " + ", ".join(f"{sd} RMS {r:.3f} px ({v} views)" for sd, (r, v) in out.items())
+                                  + (" · table pose updated" if S.calib is not None else ""), type="positive")
                 except Exception as e:
                     ui.notify(f"Calibration failed: {e}", type="negative")
                 finally:
@@ -590,26 +665,25 @@ def root():
                         ui.button(icon="chevron_right", on_click=lambda: S.step(view["stage"], 1)).props("flat dense")
                 with ui.card().classes("flex-1 min-w-0 self-stretch"):
                     ui.label("Table pose").classes("font-medium")
-                    ui.label("Lay the board flat on the table in the robot's workspace, visible in both cameras. Its first "
-                             "inner corner becomes the table origin, x along the rows, z up. Set the board thickness in "
-                             "Setup.").classes("text-sm opacity-70")
+                    ui.label("The one step per session: lay the board flat on the table in the robot's workspace, seen by "
+                             "both cameras, and capture. That one photo gives both cameras' poses and the stereo geometry. "
+                             "The origin is the inner corner next to the board's dark corner square (the axes show it), "
+                             "x along the rows, z up. Set the board thickness in Setup. Redo it whenever a camera moved.") \
+                        .classes("text-sm opacity-70")
                     btn_table = ui.button("Capture table pose", icon="table_restaurant").classes("w-full")
                     tb_result = ui.label().classes("text-sm whitespace-pre-line")
                     ui.space()
                     card_bottom = ui.column().classes("w-full")
 
             async def do_table():
-                if S.calib is None:
-                    ui.notify("Run the stereo calibration first", type="warning")
-                    return
                 left, right = view["frames"]
                 if left is None:
                     return
-                rms = await run.io_bound(capture_table, left, right)
-                if rms is None:
+                res = await run.io_bound(capture_table, left, right)
+                if res is None:
                     ui.notify("Board not found in both images", type="warning")
                     return
-                tb_result.text = f"Saved. Right-camera consistency: {rms:.2f} px\n" + camera_pose_text().replace(" · ", "\n")
+                tb_result.text = "Saved.\n" + table_text(*res)
                 ui.notify("Table pose saved", type="positive")
                 refresh_status()
                 draw_scene()
@@ -632,6 +706,8 @@ def root():
                 with ui.column().classes("w-1/2 min-w-0"):
                     with ui.row().classes("items-center"):
                         det_sw = ui.switch("Live detection")
+                        mask_sel = ui.select({"": "no mask", **{c: f"{c} mask" for c in pieces.COLORS}}, value="") \
+                            .props("dense outlined").classes("w-32").tooltip("Show only the pixels that pass a colour's thresholds")
                         ui.button(icon="chevron_left", on_click=lambda: S.step(view["stage"], -1)).props("flat")
                         ui.button(icon="chevron_right", on_click=lambda: S.step(view["stage"], 1)).props("flat")
                     with ui.row().classes("w-full no-wrap gap-2"):
@@ -643,6 +719,46 @@ def root():
                         {"name": "stereo", "label": "x, y, z (stereo) mm", "field": "stereo"},
                         {"name": "diff", "label": "Δ mm", "field": "diff"},
                     ], rows=[]).props("dense flat virtual-scroll").classes("w-full").style("max-height: calc(100vh - 490px)")
+                    with ui.expansion("Sensitivity (colour thresholds)", icon="tune").classes("w-full"):
+                        tuning = ui.column().classes("w-full gap-1")
+
+    def build_tuning():
+        """Sliders for pieces.py's thresholds. They act at once; Save keeps them for the runner too."""
+        tuning.clear()
+        P = S.params
+        def changed(*_):
+            det_cache.clear()
+        with tuning:
+            ui.label("Grey pieces with a ? in the images: only one camera sees them. Missing pieces: widen the hue, "
+                     "lower S / V min (use the mask to see what passes). Too many: the reverse, or raise min fill / rim.") \
+                .classes("text-xs opacity-70")
+            for name, c in P["colors"].items():
+                with ui.row().classes("w-full items-center no-wrap gap-3"):
+                    ui.label(name).classes("w-12 text-sm").style(f"color: {HEX[name]}")
+                    lo, hi = (-60, 60) if name == "red" else (0, 180)
+                    hue = ui.range(min=lo, max=hi, value={"min": c["h"][0], "max": c["h"][1]}).props("label").classes("flex-1")
+                    hue.on_value_change(lambda e, c=c: (c.update(h=(int(e.value["min"]), int(e.value["max"]))), changed()))
+                    ui.label("S≥").classes("text-xs")
+                    ui.slider(min=0, max=255, value=c["s"], on_change=lambda e, c=c: (c.update(s=int(e.value)), changed())) \
+                        .props("label").classes("w-24")
+                    ui.label("V≥").classes("text-xs")
+                    ui.slider(min=0, max=255, value=c["v"], on_change=lambda e, c=c: (c.update(v=int(e.value)), changed())) \
+                        .props("label").classes("w-24")
+            with ui.row().classes("w-full items-center no-wrap gap-3"):
+                for key, label in (("min_fill", "min fill"), ("min_rim", "min rim")):
+                    ui.label(label).classes("text-sm")
+                    ui.slider(min=0.2, max=0.95, step=0.05, value=P[key],
+                              on_change=lambda e, key=key: (P.update({key: float(e.value)}), changed())).props("label").classes("flex-1")
+            with ui.row().classes("gap-2"):
+                def save():
+                    pieces.save_params(S.params_path, S.params)
+                    ui.notify(f"Saved to {S.params_path.relative_to(Path(__file__).parent)}: the runner uses it", type="positive")
+                def reset():
+                    S.params = pieces.load_params()
+                    changed()
+                    build_tuning()
+                ui.button("Save", icon="save", on_click=save).props("dense")
+                ui.button("Reset to defaults", icon="restart_alt", on_click=reset).props("dense flat")
 
     scene_objs = {"static": [], "pieces": []}
 
@@ -685,10 +801,11 @@ def root():
         scene_objs["pieces"].clear()
         m = 1e-3
         with scene:
-            for p, _ in rows:
-                x, y, z = p.table_mm
+            for p, st in rows:
+                x, y, z = p.table_mm if st is None else (st[0], st[1], p.table_mm[2])
                 cyl = scene.cylinder(pieces.PIECE_D_MM / 2 * m, pieces.PIECE_D_MM / 2 * m, pieces.PIECE_H_MM * m, 32)
-                cyl.rotate(np.pi / 2, 0, 0).move(float(x) * m, float(y) * m, float(z - pieces.PIECE_H_MM / 2) * m).material(HEX[p.color])
+                cyl.rotate(np.pi / 2, 0, 0).move(float(x) * m, float(y) * m, float(z - pieces.PIECE_H_MM / 2) * m) \
+                    .material(HEX[p.color], opacity=1.0 if st is not None else 0.25)
                 scene_objs["pieces"].append(cyl)
 
     # ---- live loop ----
@@ -696,7 +813,8 @@ def root():
     coverage_cache = {}
     det_cache = {}
 
-    tab_stage = {t_stereo.props["name"]: "calib", t_table.props["name"]: "table", t_3d.props["name"]: "scene"}
+    tab_stage = {t_stereo.props["name"]: "calib", t_table.props["name"]: "table", t_3d.props["name"]: "scene",
+}
 
     async def tick():
         tab = tabs.value if isinstance(tabs.value, str) else tabs.value.props["name"]
@@ -726,15 +844,18 @@ def root():
                 if stereo_tab:
                     key = len(S.pairs)
                     if coverage_cache.get("key") != key:
-                        coverage_cache.update(key=key, l=[p.left for p in S.pairs], r=[p.right for p in S.pairs])
+                        coverage_cache.update(key=key, l=[p.left for p in S.pairs if p.left is not None],
+                                              r=[p.right for p in S.pairs if p.right is not None])
                     vl = draw_board(left, cl, S.pattern, coverage_cache["l"])
                     vr = draw_board(right, cr, S.pattern, coverage_cache["r"])
                     st_left.set_source(to_url(vl))
                     st_right.set_source(to_url(vr))
                     st_found.text = found
-                    if auto.value and cl is not None and cr is not None and time.time() - S.last_auto > 1.5:
-                        centre = cl.mean(0)
-                        if all(np.linalg.norm(centre - p.left.mean(0)) > 0.08 * left.shape[1] for p in S.pairs):
+                    if auto.value and (cl is not None or cr is not None) and time.time() - S.last_auto > 1.5:
+                        side, c = ("left", cl) if cl is not None else ("right", cr)
+                        centre = c.mean(0)
+                        if all(getattr(p, side) is None or np.linalg.norm(centre - getattr(p, side).mean(0)) > 0.08 * left.shape[1]
+                               for p in S.pairs):
                             S.last_auto = time.time()
                             await do_capture(quiet=True)
                 else:
@@ -748,10 +869,10 @@ def root():
                     tb_found.text = found
             elif tab == t_3d.props["name"]:
                 if det_sw.value and S.views is not None:
-                    key = hash(left[::16, ::16].tobytes() + right[::16, ::16].tobytes())
+                    key = hash(left[::16, ::16].tobytes() + right[::16, ::16].tobytes()) + hash(mask_sel.value)
                     if key == det_cache.get("key"):
                         return  # same frames as last time (e.g. image files): nothing to redo
-                    result = await run.io_bound(detect_both, left, right)
+                    result = await run.io_bound(detect_both, left, right, mask_sel.value or None)
                     if result is None:
                         return
                     _, _, vl, vr, rows = result
@@ -762,7 +883,7 @@ def root():
                     for p, st in rows:
                         x, y, _ = p.table_mm
                         diff = "" if st is None else f"{np.linalg.norm(np.array([x, y, p.table_mm[2]]) - st):.1f}"
-                        stereo = "no match" if st is None else f"{st[0]:.1f}, {st[1]:.1f}, {st[2]:.1f}"
+                        stereo = "left camera only (ignored)" if st is None else f"{st[0]:.1f}, {st[1]:.1f}, {st[2]:.1f}"
                         table_rows.append({"color": p.color, "plane": f"{x:.1f}, {y:.1f}", "stereo": stereo, "diff": diff})
                     det_table.rows = table_rows
                     det_table.update()
@@ -783,6 +904,7 @@ def root():
         no_webgl.visible = not ok
         scene.visible = bool(ok)
 
+    build_tuning()
     ui.timer(0.25, tick)
     ui.timer(1.0, check_webgl, once=True)
     refresh_pairs()

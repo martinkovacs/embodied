@@ -39,6 +39,7 @@ import tempfile
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -185,6 +186,12 @@ class Vision:
         if self.calib.T_left_table is None:
             raise RuntimeError(f"{path} has no table pose: run calib_gui.py and capture the table pose")
         st = cameras.load_settings()
+        made_with = self.calib.cameras
+        if not synthetic and made_with and (made_with.get("left"), made_with.get("right")) != (st["left"], st["right"]):
+            raise RuntimeError(f"{path} was made with left {made_with.get('left')} / right {made_with.get('right')}, but "
+                               f"the cameras are now left {st['left']} / right {st['right']}: capture the table pose "
+                               "again in calib_gui.py (or swap the cameras back)")
+        self.params = pieces.load_params(None if synthetic else cameras.DETECTION_PATH)
         b = cameras.SYNTHETIC_BOARD_MM if synthetic else float(st["board_mm"])
         self.views = pieces.view_from_calib(self.calib, "left", b), pieces.view_from_calib(self.calib, "right", b)
         w, h = int(st["width"]), int(st["height"])
@@ -200,8 +207,10 @@ class Vision:
             if (left.shape[1], left.shape[0]) != tuple(self.calib.left.image_size):
                 raise Unplanned(f"camera gives {left.shape[1]}x{left.shape[0]}, calibrated at "
                                 f"{self.calib.left.image_size[0]}x{self.calib.left.image_size[1]}")
-            found = pieces.matched_pieces(self.calib, pieces.detect_pieces(left, self.views[0]),
-                                          pieces.detect_pieces(right, self.views[1]))
+            with ThreadPoolExecutor(2) as pool:     # OpenCV releases the GIL: both cameras at once
+                pl, pr = pool.map(lambda iv: pieces.detect_pieces(iv[0], iv[1], params=self.params),
+                                  ((left, self.views[0]), (right, self.views[1])))
+            found = pieces.matched_pieces(self.calib, pl, pr)
         # only pieces both cameras agree on: one camera alone is where false detections come from
         return [(p.color, float(st[0]), float(st[1])) for p, st in found if st is not None], (left, right)
 

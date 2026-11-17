@@ -67,12 +67,15 @@ Plug in both cameras too, if they aren't already.
 
 A window opens.
 
-1. **Setup tab:** press **Use the Basler cameras**. Set the board's real square size and thickness. Press **Connect**.
-2. **Stereo tab:** hold the checkerboard in view of both cameras and press capture, 15 to 25 times, at different
-   angles and in different corners of the image. Press calibrate. The RMS must be **under 0.5**.
-3. **Table pose tab:** lay the board flat on the table in front of the arm, seen by both cameras. Press
-   **Capture table pose**.
-4. **Write down which corner the coloured axes start from, and which way x and y point.** That corner is (0, 0).
+1. **Setup tab:** press **Use the Basler cameras** (the ⇄ button swaps left and right). Set the board's real square
+   size and thickness. Press **Connect**.
+2. **Lens tab (once per camera, not every session):** hold the checkerboard in view and press capture, 15 to 25
+   times per camera, at different angles and in different corners of the image. One camera at a time is fine.
+   Press **Calibrate lenses**. The RMS must be **under 0.5**. It is saved per camera and reused in later sessions.
+3. **Table pose tab (every session):** lay the board flat on the table in front of the arm, seen by both cameras.
+   Press **Capture table pose**. That one photo calibrates the session.
+4. **Write down which corner the coloured axes start from, and which way x and y point.** That corner is (0, 0):
+   the inner corner next to the board's dark corner square.
 
 **Don't move the cameras, the table or the arm from now on.** Leave the board where it is and close the window.
 
@@ -201,7 +204,7 @@ The first one that is missing shows where the start broke:
 | Basler image too dark or colours shifting | Exposure and white balance are automatic: add light, and don't change it during a session |
 | Only one camera available | `calib_gui.py --one-camera` tries out the GUI, but can't be used for the real run |
 | "Camera gave no image" | Plug the two cameras into different USB ports |
-| A colour isn't detected | Check the lighting, then tune the HSV ranges in `pieces.py` |
+| A colour isn't detected, or a piece is seen twice | Check the lighting, then tune the thresholds under *Sensitivity* in calib_gui.py's detection tab (the colour mask shows what passes) and press Save |
 | "Closed on nothing" with a piece in the gripper | Lower `EMPTY_MARGIN` in `arm_node.py`, and restart `./lab.sh arm` |
 | An empty gripper isn't noticed by the arm | Expected for now: the cameras catch the miss. Not yet tuned on the real arm |
 | The fingers hit the table or miss the piece | Press STOP, then adjust `GRASP_Z` in `kinematics.py` and restart `./lab.sh arm` |

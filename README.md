@@ -165,12 +165,15 @@ If the link to rosbridge drops, STOP can't reach the arm: the panel says so in r
    OpenMANIPULATOR-X. A differently sized (e.g. 3D-printed) arm needs its own lengths there, measured
    joint axis to joint axis, and `TOOL` measured from joint 4 to the fingertips. Rerun the kinematics
    self-test afterwards.
-2. **Cameras.** `./lab.sh python calib_gui.py`: turn off test mode, capture 15-25 checkerboard pairs
-   (9 × 6 inner corners, 25 mm squares) at different angles. Accept if the RMS error is < 0.5 px.
-3. **Table pose.** In the same GUI: lay the checkerboard flat on the table and capture the table pose. This
-   defines the table frame every position is measured in. Once that's done, don't move the cameras or the table.
-4. **Colours.** Check the detection tab under the lab lights. Tune the HSV ranges in `pieces.py` if a colour
-   is missed.
+2. **Lenses (once per camera).** `./lab.sh python calib_gui.py`: turn off test mode, capture 15-25 checkerboard
+   views per camera (9 × 6 inner corners, 25 mm squares) at different angles. Accept if the RMS error is < 0.5 px.
+   Saved per camera in `calib_data/lens.json` and reused by later sessions.
+3. **Table pose (every session).** In the same GUI: lay the checkerboard flat on the table and capture the table
+   pose. That one photo gives both cameras' poses and the stereo geometry, and defines the table frame every
+   position is measured in. Once that's done, don't move the cameras or the table. Without a lens calibration the
+   photo estimates the focal lengths too (no distortion): fine for trying things, not for the real thing.
+4. **Colours.** Check the detection tab under the lab lights. Tune the thresholds under *Sensitivity* if a colour
+   is missed or a piece is seen twice, then Save (`calib_data/detection.json`, which the runner reads).
 5. **Table → robot.** `./lab.sh python robot_frame.py`: close the gripper and touch the
    fingertips to 4-6 known table points spread over the work area (torque off, move by hand). Then
    `--check` on new points: accept if every error is < 5 mm. Redo after re-capturing the table pose. Each
