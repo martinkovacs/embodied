@@ -286,18 +286,30 @@ def canonical_corners(img: np.ndarray, corners: np.ndarray, pattern=PATTERN) -> 
     return c
 
 
-def estimate_camera(corners: np.ndarray, image_size, pattern=PATTERN, square_mm=25.0) -> CameraCalib:
-    """Intrinsics from ONE view of a flat board seen at an angle: only the focal length (principal point at the
-    image centre, square pixels, no lens distortion). Good to a fraction of a percent for a lens with little
-    distortion; calibrate_camera from many views is the accurate way, and only needed once per camera."""
+FULL_MODEL_VIEWS = 6     # views of a camera from which its lens distortion is fitted too
+
+
+def calibrate_lens(corners: list[np.ndarray], image_size, pattern=PATTERN,
+                   square_mm=25.0) -> tuple[CameraCalib, list[float], str]:
+    """Intrinsics from however many views there are (one is enough). Under FULL_MODEL_VIEWS only the focal length
+    is fitted (principal point at the image centre, square pixels, no distortion), which a single view of a board
+    seen at an angle pins down well; from FULL_MODEL_VIEWS on, the full model (calibrate_camera).
+    Returns (camera, per-view RMS px, "full" | "focal length only")."""
+    if len(corners) >= FULL_MODEL_VIEWS:
+        cam, errs = calibrate_camera(corners, image_size, pattern, square_mm)
+        return cam, errs, "full"
+    if not corners:
+        raise ValueError("no view of the board")
     w, h = image_size
     K0 = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1.0]])
     flags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT | cv2.CALIB_FIX_ASPECT_RATIO
              | cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3)
-    obj = object_points(pattern, square_mm).reshape(-1, 1, 3)
-    rms, K, dist, _, _ = cv2.calibrateCamera([obj], [corners.astype(np.float32).reshape(-1, 1, 2)], (w, h), K0,
-                                             np.zeros(5), flags=flags)
-    return CameraCalib(K, np.zeros(5), (w, h), float(rms))
+    obj = object_points(pattern, square_mm)
+    rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+        [obj.reshape(-1, 1, 3)] * len(corners), [c.astype(np.float32).reshape(-1, 1, 2) for c in corners],
+        (w, h), K0, np.zeros(5), flags=flags)
+    per_view = [_rms_px(cv2.projectPoints(obj, rv, tv, K, dist)[0], c) for rv, tv, c in zip(rvecs, tvecs, corners)]
+    return CameraCalib(K, np.zeros(5), (w, h), float(rms)), per_view, "focal length only"
 
 
 def stereo_from_table(corners_left, corners_right, left: CameraCalib, right: CameraCalib, pattern=PATTERN,

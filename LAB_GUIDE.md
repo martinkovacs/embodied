@@ -69,12 +69,10 @@ A window opens.
 
 1. **Setup tab:** press **Use the Basler cameras** (the ⇄ button swaps left and right). Set the board's real square
    size and thickness. Press **Connect**.
-2. **Lens tab (once per camera, not every session):** hold the checkerboard in view and press capture, 15 to 25
-   times per camera, at different angles and in different corners of the image. One camera at a time is fine.
-   Press **Calibrate lenses**. The RMS must be **under 0.5**. It is saved per camera and reused in later sessions.
-3. **Table pose tab (every session):** lay the board flat on the table in front of the arm, seen by both cameras.
-   Press **Capture table pose**. That one photo calibrates the session.
-4. **Write down which corner the coloured axes start from, and which way x and y point.** That corner is (0, 0):
+2. **Calibration tab:** lay the board flat on the table in front of the arm, seen by both cameras, and press
+   **Capture**. That one capture is the calibration. Optional, for a better lens model: also capture the board held
+   at other angles; from 6 views per camera the lens distortion is fitted too.
+3. **Write down which corner the coloured axes start from, and which way x and y point.** That corner is (0, 0):
    the inner corner next to the board's dark corner square.
 
 **Don't move the cameras, the table or the arm from now on.** Leave the board where it is and close the window.

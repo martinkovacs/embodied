@@ -165,27 +165,25 @@ If the link to rosbridge drops, STOP can't reach the arm: the panel says so in r
    OpenMANIPULATOR-X. A differently sized (e.g. 3D-printed) arm needs its own lengths there, measured
    joint axis to joint axis, and `TOOL` measured from joint 4 to the fingertips. Rerun the kinematics
    self-test afterwards.
-2. **Lenses (once per camera).** `./lab.sh python calib_gui.py`: turn off test mode, capture 15-25 checkerboard
-   views per camera (9 × 6 inner corners, 25 mm squares) at different angles. Accept if the RMS error is < 0.5 px.
-   Saved per camera in `calib_data/lens.json` and reused by later sessions.
-3. **Table pose (every session).** In the same GUI: lay the checkerboard flat on the table and capture the table
-   pose. That one photo gives both cameras' poses and the stereo geometry, and defines the table frame every
-   position is measured in. Once that's done, don't move the cameras or the table. Without a lens calibration the
-   photo estimates the focal lengths too (no distortion): fine for trying things, not for the real thing.
-4. **Colours.** Check the detection tab under the lab lights. Tune the thresholds under *Sensitivity* if a colour
+2. **Cameras + table pose.** `./lab.sh python calib_gui.py`, Calibration tab: lay the checkerboard (9 × 6 inner
+   corners, 25 mm squares) flat on the table, seen by both cameras, and press Capture. That one capture gives both
+   cameras' poses and the stereo geometry, and defines the table frame every position is measured in. Extra
+   captures of the board at other angles improve the lens model (from 6 per camera: distortion too). Once that's
+   done, don't move the cameras or the table.
+3. **Colours.** Check the detection tab under the lab lights. Tune the thresholds under *Sensitivity* if a colour
    is missed or a piece is seen twice, then Save (`calib_data/detection.json`, which the runner reads).
-5. **Table → robot.** `./lab.sh python robot_frame.py`: close the gripper and touch the
+4. **Table → robot.** `./lab.sh python robot_frame.py`: close the gripper and touch the
    fingertips to 4-6 known table points spread over the work area (torque off, move by hand). Then
    `--check` on new points: accept if every error is < 5 mm. Redo after re-capturing the table pose. Each
    pick / place then carries the table's height at that spot, so a slightly tilted table is fine. The arm
    goes down and up in 5 mm IK steps (truly vertical), so 40 mm between pieces leaves room for the fingers;
    measure the open fingers on the real gripper and raise `SPACING_MM` in `runner.py` if they need more.
-6. **Layout.** `./lab.sh python lab_layout.py` writes `layouts/lab.yaml`; `--view` draws it on the cameras so
+5. **Layout.** `./lab.sh python lab_layout.py` writes `layouts/lab.yaml`; `--view` draws it on the cameras so
    you can place the pieces. The runner refuses a layout with a spot the arm can't reach.
-7. **Microphone and voice.** Place the microphone near the participant, away from the arm's motors and the
+6. **Microphone and voice.** Place the microphone near the participant, away from the arm's motors and the
    speaker. `./lab.sh python speech.py --test --lang <participant's language>`: the level should move when
    someone talks, and yes / no / the colours should come out right. Listen to the six WAVs (see section 2).
-8. **Dry runs.** 50 pick-and-place moves with no unplanned errors (tune `EMPTY_MARGIN` in `arm_node.py`
+7. **Dry runs.** 50 pick-and-place moves with no unplanned errors (tune `EMPTY_MARGIN` in `arm_node.py`
    if a good grasp is reported as "closed on nothing"), then a pilot of every condition.
    Check the log and timing.
 
