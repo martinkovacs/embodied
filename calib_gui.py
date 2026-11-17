@@ -339,16 +339,21 @@ def result_text():
 
 
 def detect_both(left, right, mask_color=None):
-    """Both cameras' detections, paired. Pieces only one camera sees are drawn grey with a "?": the runner ignores
-    them (that's where false detections come from)."""
+    """Both cameras' detections, paired, and the pictures of it: {"matched", "cams": (left, right) with the pieces
+    drawn, "tops": the top views the detector works on}. Pieces only one camera sees are grey with a "?": the
+    runner ignores them. Near misses are drawn thin grey with their rim / fill scores."""
     vl, vr = S.views
     params = S.params
+
+    def one(img, view):
+        top, misses = view.warp(img), []
+        return pieces.detect_pieces(img, view, params=params, rejected=misses, top=top), misses, top
     if one_camera():   # one camera: one detection, and no disparity to triangulate from: the table plane
-        pl = pieces.detect_pieces(left, vl, params=params)
-        pr, matched = pl, [(p, np.array(p.table_mm)) for p in pl]
+        (pl, ml, tl), = [one(left, vl)]
+        (pr, mr, tr), matched = (pl, ml, tl), [(p, np.array(p.table_mm)) for p in pl]
     else:
         with ThreadPoolExecutor(2) as pool:
-            pl, pr = pool.map(lambda iv: pieces.detect_pieces(iv[0], iv[1], params=params), ((left, vl), (right, vr)))
+            (pl, ml, tl), (pr, mr, tr) = pool.map(lambda iv: one(*iv), ((left, vl), (right, vr)))
         matched = pieces.matched_pieces(S.calib, pl, pr)
     lone_l = [p for p, st in matched if st is None]
     paired_r = set()
@@ -359,7 +364,38 @@ def detect_both(left, right, mask_color=None):
     lone_r = [q for q in pr if q.table_mm not in paired_r] if not one_camera() else []
     if mask_color:
         left, right = pieces.mask_view(left, params, mask_color), pieces.mask_view(right, params, mask_color)
-    return pl, pr, pieces.draw(left, pl, vl, lone=lone_l), pieces.draw(right, pr, vr, lone=lone_r), matched
+        tl, tr = pieces.mask_view(tl, params, mask_color), pieces.mask_view(tr, params, mask_color)
+    cams = (pieces.draw_misses(pieces.draw(left, pl, vl, lone=lone_l), ml, vl),
+            pieces.draw_misses(pieces.draw(right, pr, vr, lone=lone_r), mr, vr))
+    tops = (pieces.draw_top(tl, pl, ml, vl.ppm, lone_l), pieces.draw_top(tr, pr, mr, vr.ppm, lone_r))
+    return {"matched": matched, "cams": cams, "tops": tops}
+
+
+def teach_click(img, side, u, v, kind, color=None):
+    """A click on a piece (camera image or top-view pixel): widen its colour's thresholds until it's detected.
+    Returns a message."""
+    view = S.views[0 if side == "left" else 1]
+    if kind == "cam":
+        u, v = view.image_to_view(u, v)
+    top = view.warp(img)
+    color, changed = pieces.teach(top, u, v, view.ppm, S.params, color)
+    r = pieces.PIECE_D_MM / 2 * view.ppm
+    for _ in range(2):    # still not found: the rim or fill score keeps it out, lower that floor (not below 0.3)
+        misses = []
+        found = pieces.detect_pieces(img, view, params=S.params, rejected=misses, top=top)
+        if any(np.hypot(p.view_uv[0] - u, p.view_uv[1] - v) < r for p in found):
+            return f"{color}: {', '.join(changed) or 'thresholds already fit'}: detected"
+        near = [m for m in misses if np.hypot(m.view_uv[0] - u, m.view_uv[1] - v) < r]
+        if not near:
+            break
+        m = near[0]
+        for key, score in (("min_rim", m.rim), ("min_fill", m.fill)):
+            if score < S.params[key]:
+                new = max(0.3, round(score - 0.05, 2))
+                if new < S.params[key]:
+                    changed.append(f"{key} {S.params[key]:.2f} -> {new:.2f}")
+                    S.params[key] = new
+    return f"{color}: {', '.join(changed) or 'no change'}: still not detected (not a whole piece top there?)"
 
 
 # ---------- UI ----------
@@ -657,35 +693,84 @@ def root():
             btn_import.on_click(do_import)
             btn_clear.on_click(clear_pairs)
 
-        # ---- 4 3D & detection ----
-        with ui.tab_panel(t_3d):
-            with ui.row().classes("w-full no-wrap gap-4 items-start"):
-                with ui.column().classes("w-1/2 min-w-0"):
-                    scene = ui.scene(grid=(2, 40), background_color="#18181b").classes("w-full h-[calc(100vh-235px)]")
-                    no_webgl = ui.label("The 3D view needs WebGL, which this browser can't provide. Start the app with "
-                                        "`python calib_gui.py` (its window uses software WebGL).") \
-                        .classes("text-amber-400 text-sm")
-                    no_webgl.visible = False
-                    ui.label("Grid: 5 cm cells. Table frame axes: x red, y green, z blue. Units in the view are metres.") \
-                        .classes("text-xs opacity-60")
-                with ui.column().classes("w-1/2 min-w-0"):
-                    with ui.row().classes("items-center"):
-                        det_sw = ui.switch("Live detection")
-                        mask_sel = ui.select({"": "no mask", **{c: f"{c} mask" for c in pieces.COLORS}}, value="") \
-                            .props("dense outlined").classes("w-32").tooltip("Show only the pixels that pass a colour's thresholds")
-                        ui.button(icon="chevron_left", on_click=lambda: S.step(view["stage"], -1)).props("flat")
-                        ui.button(icon="chevron_right", on_click=lambda: S.step(view["stage"], 1)).props("flat")
-                    with ui.row().classes("w-full no-wrap gap-2"):
-                        det_left = ui.interactive_image().classes("w-1/2")
-                        det_right = ui.interactive_image().classes("w-1/2")
+        # ---- 3 3D & detection ----
+        with ui.tab_panel(t_3d).classes("p-2"):
+            with ui.row().classes("w-full no-wrap gap-3 items-start"):
+                with ui.column().classes("flex-1 min-w-0 gap-2"):
+                    with ui.row().classes("w-full items-center gap-2"):
+                        det_kind = ui.toggle({"cam": "Camera", "top": "Top view", "3d": "3D"}, value="cam").props("dense")
+                        det_side = ui.toggle({"left": "Left", "right": "Right", "both": "Both"}, value="left").props("dense") \
+                            .bind_visibility_from(det_kind, "value", lambda k: k != "3d")
+                        ui.space()
+                        det_sw = ui.switch("Live detection", value=True)
+                        ui.button(icon="chevron_left", on_click=lambda: S.step(view["stage"], -1)).props("flat dense")
+                        ui.button(icon="chevron_right", on_click=lambda: S.step(view["stage"], 1)).props("flat dense")
+                        ui.button(icon="fullscreen", on_click=lambda: open_zoom()).props("flat dense") \
+                            .tooltip("Full screen, with zoom").bind_visibility_from(det_kind, "value", lambda k: k != "3d")
+                    with ui.column().classes("w-full gap-1").bind_visibility_from(det_kind, "value", lambda k: k != "3d"):
+                        with ui.row().classes("w-full no-wrap gap-2"):
+                            det_left = ui.interactive_image(events=["click"]).classes("w-full cursor-crosshair")
+                            det_right = ui.interactive_image(events=["click"]).classes("w-full cursor-crosshair")
+                        ui.label("Coloured: detected. Grey with a ?: only one camera sees it (ignored). Thin grey with "
+                                 "scores: a near miss, and which score keeps it out. Click a piece's top to tune its colour "
+                                 "to it.").classes("text-xs opacity-60")
+                    with ui.column().classes("w-full gap-1").bind_visibility_from(det_kind, "value", value="3d"):
+                        scene = ui.scene(grid=(2, 40), background_color="#18181b").classes("w-full h-[calc(100vh-250px)]")
+                        no_webgl = ui.label("The 3D view needs WebGL, which this browser can't provide. Start the app with "
+                                            "`python calib_gui.py` (its window uses software WebGL).") \
+                            .classes("text-amber-400 text-sm")
+                        no_webgl.visible = False
+                        with ui.row().classes("items-center gap-1"):
+                            ui.button(icon="zoom_in", on_click=lambda: zoom_scene(0.7)).props("flat dense").tooltip("Zoom in")
+                            ui.button(icon="zoom_out", on_click=lambda: zoom_scene(1.4)).props("flat dense").tooltip("Zoom out")
+                            ui.button(icon="center_focus_strong", on_click=lambda: fit_scene()).props("flat dense") \
+                                .tooltip("Fit the pieces")
+                            ui.button(icon="restart_alt", on_click=lambda: draw_scene()).props("flat dense").tooltip("Reset the view")
+                            ui.label("Mouse: drag to rotate, right-drag to pan, wheel to zoom. Grid: 5 cm cells. Axes: x red, "
+                                     "y green, z blue.").classes("text-xs opacity-60 ml-2")
+                with ui.card().classes("w-[400px] shrink-0 gap-2 overflow-auto").style("max-height: calc(100vh - 150px)"):
+                    ui.label("Sensitivity").classes("font-medium")
+                    with ui.row().classes("w-full items-center no-wrap gap-2"):
+                        teach_sw = ui.switch("Click to tune", value=True) \
+                            .tooltip("Click the middle of a piece's top in the image: its colour's thresholds widen to take it in")
+                        teach_color = ui.select({"": "colour: auto", **{c: c for c in pieces.COLORS}}, value="") \
+                            .props("dense outlined").classes("w-32")
+                    mask_sel = ui.select({"": "no mask", **{c: f"{c} mask" for c in pieces.COLORS}}, value="") \
+                        .props("dense outlined").classes("w-full").tooltip("Show only the pixels that pass a colour's thresholds")
+                    tuning = ui.column().classes("w-full gap-1")
                     det_table = ui.table(columns=[
                         {"name": "color", "label": "colour", "field": "color"},
-                        {"name": "plane", "label": "x, y (plane, left cam) mm", "field": "plane"},
-                        {"name": "stereo", "label": "x, y, z (stereo) mm", "field": "stereo"},
-                        {"name": "diff", "label": "Δ mm", "field": "diff"},
-                    ], rows=[]).props("dense flat virtual-scroll").classes("w-full").style("max-height: calc(100vh - 490px)")
-                    with ui.expansion("Sensitivity (colour thresholds)", icon="tune").classes("w-full"):
-                        tuning = ui.column().classes("w-full gap-1")
+                        {"name": "stereo", "label": "x, y, z mm", "field": "stereo"},
+                        {"name": "diff", "label": "Δ plane", "field": "diff"},
+                    ], rows=[]).props("dense flat").classes("w-full")
+
+    zoom = {"open": False, "pct": 100}
+    with ui.dialog().props("maximized") as zoom_dlg, ui.card().classes("w-full h-full p-2 gap-2"):
+        with ui.row().classes("w-full items-center gap-2"):
+            zoom_title = ui.label().classes("font-medium")
+            ui.space()
+            ui.button(icon="zoom_out", on_click=lambda: set_zoom(zoom["pct"] / 1.25)).props("flat dense")
+            zoom_lbl = ui.label("100%").classes("w-12 text-center text-sm")
+            ui.button(icon="zoom_in", on_click=lambda: set_zoom(zoom["pct"] * 1.25)).props("flat dense")
+            ui.button(icon="fit_screen", on_click=lambda: set_zoom(100)).props("flat dense").tooltip("Fit the width")
+            ui.button(icon="close", on_click=zoom_dlg.close).props("flat dense")
+        with ui.element("div").classes("w-full grow overflow-auto") as zoom_box:
+            zoom_img = ui.interactive_image(events=["click"]).classes("cursor-crosshair").style("width: 100%; max-width: none")
+        ui.label("Ctrl + wheel zooms, scroll bars pan. Click a piece's top to tune its colour to it.").classes("text-xs opacity-60")
+    zoom_dlg.on("hide", lambda: zoom.update(open=False))
+    zoom_box.on("wheel", lambda e: set_zoom(zoom["pct"] * (1.15 if e.args["deltaY"] < 0 else 1 / 1.15))
+                if e.args.get("ctrlKey") else None, ["deltaY", "ctrlKey"], throttle=0.05)
+
+    def set_zoom(pct):
+        zoom["pct"] = float(np.clip(pct, 25, 800))
+        zoom_img.style(f"width: {zoom['pct']:.0f}%; max-width: none")
+        zoom_lbl.text = f"{zoom['pct']:.0f}%"
+
+    def open_zoom():
+        zoom.update(open=True)
+        set_zoom(100)
+        show_det()
+        zoom_dlg.open()
 
     def build_tuning():
         """Sliders for pieces.py's thresholds. They act at once; Save keeps them for the runner too."""
@@ -773,10 +858,79 @@ def root():
                     .material(HEX[p.color], opacity=1.0 if st is not None else 0.25)
                 scene_objs["pieces"].append(cyl)
 
+    async def zoom_scene(factor):
+        cam = await scene.get_camera()
+        pos = np.array([cam["position"][k] for k in ("x", "y", "z")])
+        c = scene.camera
+        at = np.array([c.look_at_x, c.look_at_y, c.look_at_z])
+        new = at + (pos - at) * factor
+        scene.move_camera(*map(float, new), *map(float, at), duration=0.3)
+
+    def fit_scene():
+        pts = [((st if st is not None else p.table_mm)[0], (st if st is not None else p.table_mm)[1])
+               for p, st in det_state.get("matched", [])]
+        if not pts:
+            cols, rows = S.pattern
+            pts = [(0, 0), ((cols - 1) * S.square, (rows - 1) * S.square)]
+        pts = np.array(pts) * 1e-3
+        mid, size = pts.mean(0), max(np.ptp(pts, 0).max(), 0.1)
+        scene.move_camera(float(mid[0]) + 0.6 * size, float(mid[1]) - 1.2 * size, 1.2 * size,
+                          float(mid[0]), float(mid[1]), 0.0, duration=0.4)
+
     # ---- live loop ----
     busy = {"v": False}
     coverage_cache = {}
     det_cache = {}
+    det_state = {}   # last raw frames and detection result: what a click teaches from
+
+    def show_det():
+        """Put the latest pictures into the visible image elements (and the zoom dialog)."""
+        res, kind, side = det_state.get("res"), det_kind.value, det_side.value
+        frames = det_state.get("frames")
+        if frames is None:
+            return
+        pics = (res["cams"] if kind == "cam" else res["tops"]) if res else frames
+        both = side == "both"
+        det_left.visible, det_right.visible = side != "right", side != "left"
+        width = 960 if both else 1600
+        for el, sd, img in ((det_left, "left", pics[0]), (det_right, "right", pics[1])):
+            if el.visible:
+                el.set_source(to_url(img, width))
+                el.props["data-scale"] = img.shape[1] / min(width, img.shape[1])
+        if zoom["open"]:
+            sd = "right" if side == "right" else "left"
+            img = pics[1] if sd == "right" else pics[0]
+            zoom_title.text = f"{sd} camera · {'top view' if kind == 'top' else 'image'}"
+            zoom_img.set_source(to_url(img, img.shape[1]))
+            zoom_img.props["data-scale"] = 1.0
+            zoom_img.props["data-side"] = sd
+
+    async def on_det_click(e, side):
+        if not teach_sw.value or S.views is None or "frames" not in det_state:
+            if not teach_sw.value and e.sender is not zoom_img:
+                open_zoom()
+            return
+        if det_kind.value == "3d":
+            return
+        side = e.sender.props.get("data-side", side)
+        scale = float(e.sender.props.get("data-scale", 1.0))
+        img = det_state["frames"][0 if side == "left" else 1]
+        try:
+            msg = await run.io_bound(teach_click, img, side, e.image_x * scale, e.image_y * scale,
+                                     det_kind.value, teach_color.value or None)
+        except ValueError as err:
+            ui.notify(str(err), type="warning")
+            return
+        ui.notify(msg + " (Save keeps it)", type="positive" if "detected" in msg and "not" not in msg else "warning",
+                  multi_line=True)
+        det_cache.clear()
+        build_tuning()
+
+    det_left.on_mouse(lambda e: on_det_click(e, "left"))
+    det_right.on_mouse(lambda e: on_det_click(e, "right"))
+    zoom_img.on_mouse(lambda e: on_det_click(e, "left"))
+    det_kind.on_value_change(lambda: show_det())
+    det_side.on_value_change(lambda: show_det())
 
     tab_stage = {t_stereo.props["name"]: "calib", t_3d.props["name"]: "scene",
 }
@@ -822,24 +976,20 @@ def root():
                         S.last_auto = time.time()
                         await do_capture(quiet=True)
             elif tab == t_3d.props["name"]:
+                det_state["frames"] = (left, right)
                 if det_sw.value and S.views is not None:
                     key = hash(left[::16, ::16].tobytes() + right[::16, ::16].tobytes()) + hash(mask_sel.value)
                     if key == det_cache.get("key"):
                         return  # same frames as last time (e.g. image files): nothing to redo
-                    result = await run.io_bound(detect_both, left, right, mask_sel.value or None)
-                    if result is None:
-                        return
-                    _, _, vl, vr, rows = result
+                    res = await run.io_bound(detect_both, left, right, mask_sel.value or None)
                     det_cache["key"] = key
-                    det_left.set_source(to_url(vl))
-                    det_right.set_source(to_url(vr))
-                    table_rows = []
-                    for p, st in rows:
-                        x, y, _ = p.table_mm
-                        diff = "" if st is None else f"{np.linalg.norm(np.array([x, y, p.table_mm[2]]) - st):.1f}"
-                        stereo = "left camera only (ignored)" if st is None else f"{st[0]:.1f}, {st[1]:.1f}, {st[2]:.1f}"
-                        table_rows.append({"color": p.color, "plane": f"{x:.1f}, {y:.1f}", "stereo": stereo, "diff": diff})
-                    det_table.rows = table_rows
+                    det_state.update(res=res, matched=res["matched"])
+                    show_det()
+                    rows = res["matched"]
+                    det_table.rows = [{"color": p.color,
+                                       "stereo": "one camera only (ignored)" if st is None else f"{st[0]:.0f}, {st[1]:.0f}, {st[2]:.0f}",
+                                       "diff": "" if st is None else f"{np.hypot(p.table_mm[0] - st[0], p.table_mm[1] - st[1]):.1f}"}
+                                      for p, st in rows]
                     det_table.update()
                     sig = [(p.color, round(p.table_mm[0]), round(p.table_mm[1])) for p, _ in rows]
                     if sig != det_cache.get("sig"):
@@ -847,8 +997,8 @@ def root():
                         draw_pieces(rows)
                 else:
                     det_cache.clear()
-                    det_left.set_source(to_url(left))
-                    det_right.set_source(to_url(right))
+                    det_state.pop("res", None)
+                    show_det()
         finally:
             busy["v"] = False
 
@@ -856,7 +1006,7 @@ def root():
         ok = await ui.run_javascript(
             "(() => { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); })()")
         no_webgl.visible = not ok
-        scene.visible = bool(ok)
+        scene.set_visibility(bool(ok))
 
     build_tuning()
     ui.timer(0.25, tick)

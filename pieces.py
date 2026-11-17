@@ -104,6 +104,14 @@ class TopView:
     def view_to_table(self, u, v):
         return self.x0 + u / self.ppm, self.y1 - v / self.ppm
 
+    def image_to_view(self, u, v):
+        """Camera image pixel -> top-view pixel: where its ray meets the top-face plane."""
+        ray = cv2.undistortPoints(np.array([[[u, v]]], np.float32), self.K, self.dist).reshape(2)
+        d = self.T[:3, :3].T @ np.array([ray[0], ray[1], 1.0])
+        c = self.cam_c
+        x, y = (c + (self.z - c[2]) / d[2] * d)[:2]
+        return (x - self.x0) * self.ppm, (self.y1 - y) * self.ppm
+
     def smear(self, u, v):
         """Where a piece whose top face is centred at view (u, v) smears its side, in view px: the vector from the
         top centre to the bottom centre, seen from the camera along its ray onto the top-face plane. The camera sees
@@ -133,6 +141,40 @@ def mask_view(bgr, params, color):
     grey = cv2.cvtColor(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR) // 3
     grey[m] = bgr[m]
     return grey
+
+
+def hue_in(h, lo):
+    """Hue (0..179) in a colour's hue space: red's runs from -90, so its range doesn't wrap."""
+    return np.where(h >= 90, h - 180, h) if lo < 0 else h
+
+
+def teach(top, u, v, ppm, params, color=None):
+    """Widen color's thresholds (or the colour nearest in hue) so the top face clicked at top-view (u, v) passes:
+    hue range over its 2nd-98th percentile, S and V floors under its 10th percentile, with some margin. Only ever
+    widens. Returns (colour, what changed) or raises ValueError when the spot isn't a coloured piece."""
+    r = PIECE_D_MM / 2 * ppm
+    yy, xx = np.ogrid[:top.shape[0], :top.shape[1]]
+    disk = (xx - u) ** 2 + (yy - v) ** 2 <= (0.6 * r) ** 2
+    hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV)[disk].astype(float)
+    if len(hsv) < 20:
+        raise ValueError("that's outside the area the detector looks at")
+    H, S, V = hsv.T
+    if np.median(S) < 35:
+        raise ValueError("no colour there (the table?): click the middle of a piece's top")
+    cols = params["colors"]
+    if color is None:          # the colour whose hue range is nearest, around the hue circle
+        med = {n: np.median(hue_in(H, c["h"][0])) for n, c in cols.items()}
+        color = min(cols, key=lambda n: max(cols[n]["h"][0] - med[n], 0, med[n] - cols[n]["h"][1]))
+    c = cols[color]
+    h = hue_in(H, c["h"][0])
+    lim = (-60, 60) if c["h"][0] < 0 else (0, 180)
+    lo, hi = int(np.floor(np.percentile(h, 2))) - 3, int(np.ceil(np.percentile(h, 98))) + 3
+    new = {"h": (max(min(c["h"][0], lo), lim[0]), min(max(c["h"][1], hi), lim[1])),
+           "s": max(0, min(c["s"], int(np.percentile(S, 10)) - 10)),
+           "v": max(0, min(c["v"], int(np.percentile(V, 10)) - 10))}
+    changed = [f"{k} {c[k]} -> {new[k]}" for k in ("h", "s", "v") if tuple(np.atleast_1d(new[k])) != tuple(np.atleast_1d(c[k]))]
+    c.update(new)
+    return color, changed
 
 
 def same_piece(a, b, r_px, smear):
@@ -188,11 +230,13 @@ def rim_votes(gx, gy, mag, edge_thr, r_px, min_rim):
     return [tuple(c) for c in centroids[1:]]
 
 
-def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=None, smear=None):
+def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=None, smear=None, rejected=None):
     """Find top-face circles of radius r_px. Returns [(color, u, v, rim, fill)].
 
     smear(u, v) -> (du, dv): where a piece's side shows in this image (TopView.smear). Without it, a candidate on
-    the side of a piece seen at an angle can survive as a second detection of the same piece."""
+    the side of a piece seen at an angle can survive as a second detection of the same piece.
+    rejected: a list to receive the near misses, (color, u, v, rim, fill) of circles that failed min_rim or
+    min_fill, for tuning: they show which threshold keeps a piece out."""
     sigma = max(r_px / 25, 1.0)
     gray = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (0, 0), sigma)
     # Colour gradient: per pixel, the BGR channel with the strongest gradient. Grey alone misses
@@ -260,12 +304,15 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
         for ox, oy in (coarse, fine):  # coarse search within +-r, then fine within +-r/8
             xs, ys = x + ox, y + oy
             rim, ci, fill, br = score(xs, ys)
-            s = rim * fill * br * ((rim >= min_rim) & (fill >= min_fill))
-            k = int(s.argmax())
+            raw = rim * fill * br
+            s = raw * ((rim >= min_rim) & (fill >= min_fill))
+            k = int(s.argmax()) if s.max() > 0 else int(raw.argmax())   # nothing passes yet: follow the best try
             x, y = xs[k], ys[k]
         name = names[ci[k]]
         if s[k] > 0:
             results.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(br[k])))
+        elif rejected is not None and fill[k] >= 0.25 and rim[k] >= 0.2:
+            rejected.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(raw[k])))
 
     # Non-max suppression, best score first: one detection per piece. A candidate on the same piece as a kept one
     # (same_piece) is dropped, unless it lies further from the camera along the side band and scores at least half
@@ -282,23 +329,68 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
             k = kept[dup[0]]
             if toward_camera(k[1:3], r[1:3], smear) < -0.3 * r_px and sc(r) >= 0.5 * sc(k):
                 kept[dup[0]] = r
+    if rejected is not None:     # one near miss per place, and none on a detected piece
+        misses, rejected[:] = sorted(rejected, key=lambda r: r[5], reverse=True), []
+        for r in misses:
+            if all(np.hypot(r[1] - k[1], r[2] - k[2]) > 1.4 * r_px for k in kept + rejected):
+                rejected.append(r)
+        rejected[:] = [r[:5] for r in rejected[:40]]
     return [r[:5] for r in kept]
 
 
-def detect_pieces(img, view: TopView | None = None, radius_px=None, params=None):
+def detect_pieces(img, view: TopView | None = None, radius_px=None, params=None, rejected=None, top=None):
     """Detect pieces in a camera image. With a TopView, positions are also returned in table mm.
-    params: load_params(); the defaults if None."""
+    params: load_params(); the defaults if None. rejected: a list to receive the near misses as Pieces (see
+    detect). top: view.warp(img) if the caller already has it."""
     p = params or DEFAULT_PARAMS
     kw = dict(colors=p["colors"], min_rim=p["min_rim"], min_fill=p["min_fill"])
+    misses = None if rejected is None else []
     if view is None:
-        return [Piece(c, (u, v), (u, v), None, rim, fill) for c, u, v, rim, fill in detect(img, radius_px, **kw)]
-    top = view.warp(img)
-    pieces = []
-    for c, u, v, rim, fill in detect(top, PIECE_D_MM / 2 * view.ppm, smear=view.smear, **kw):
+        found = detect(img, radius_px, rejected=misses, **kw)
+        if rejected is not None:
+            rejected += [Piece(c, (u, v), (u, v), None, rim, fill) for c, u, v, rim, fill in misses]
+        return [Piece(c, (u, v), (u, v), None, rim, fill) for c, u, v, rim, fill in found]
+    top = view.warp(img) if top is None else top
+
+    def piece(c, u, v, rim, fill):
         x, y = view.view_to_table(u, v)
         iu, iv = view.project([[x, y, view.z]])[0]
-        pieces.append(Piece(c, (u, v), (float(iu), float(iv)), (x, y, view.z), rim, fill))
-    return pieces
+        return Piece(c, (u, v), (float(iu), float(iv)), (x, y, view.z), rim, fill)
+    found = detect(top, PIECE_D_MM / 2 * view.ppm, smear=view.smear, rejected=misses, **kw)
+    if rejected is not None:
+        rejected += [piece(*m) for m in misses]
+    return [piece(*f) for f in found]
+
+
+def draw_misses(vis, misses, view: TopView):
+    """Near misses (detect's rejected) on a camera image, thin grey with their rim and fill: which threshold to
+    lower to let that piece in."""
+    ang = np.linspace(0, 2 * np.pi, 32, endpoint=False)
+    for p in misses:
+        x, y, z = p.table_mm
+        ring = view.project(np.c_[x + PIECE_D_MM / 2 * np.cos(ang), y + PIECE_D_MM / 2 * np.sin(ang), np.full(32, z)])
+        cv2.polylines(vis, [ring.round().astype(np.int32)], True, (170, 170, 170), 1, cv2.LINE_AA)
+        label = f"{p.color}? rim {p.rim:.2f} fill {p.fill:.2f}"
+        at = (int(ring[:, 0].min()), int(ring[:, 1].max()) + 14)
+        cv2.putText(vis, label, at, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, label, at, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    return vis
+
+
+def draw_top(top, found, misses, ppm, lone=()):
+    """The top view the detector works on, with what it found (colour) and its near misses (grey, with scores)."""
+    vis = top.copy()
+    r = int(round(PIECE_D_MM / 2 * ppm))
+    for p in misses:
+        c = tuple(int(round(v)) for v in p.view_uv)
+        cv2.circle(vis, c, r, (170, 170, 170), 1, cv2.LINE_AA)
+        cv2.putText(vis, f"rim {p.rim:.2f} fill {p.fill:.2f}", (c[0] - r, c[1] + r + 14), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    for p in found:
+        alone = any(p is q for q in lone)
+        c = tuple(int(round(v)) for v in p.view_uv)
+        cv2.circle(vis, c, r, (150, 150, 150) if alone else DRAW[p.color], 2, cv2.LINE_AA)
+    return vis
 
 
 def draw(img, pieces, view: TopView | None = None, radius_px=None, lone=()):
