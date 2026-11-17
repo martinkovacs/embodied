@@ -323,6 +323,25 @@ def calibrate():
     return S.result
 
 
+def board_outline():
+    """The board's four outer inner corners in the table frame (mm, (4, 2)): where the left camera saw them in the
+    table capture, on the table plane. The table frame's y may run either way along the board (it is flipped so
+    that z points up), so this is where the board really lies."""
+    cols, rows = S.pattern
+    grid = np.array([(0, 0), (cols - 1, 0), (cols - 1, rows - 1), (0, rows - 1)], float) * S.square
+    tp = table_pair()
+    if tp is None or S.calib is None or S.calib.T_left_table is None:
+        return grid
+    cam, T = pieces.camera_table_pose(S.calib, "left")
+    n = cols * rows
+    px = tp.left[[0, cols - 1, n - 1, n - cols]]
+    rays = cv2.undistortPoints(px.reshape(-1, 1, 2).astype(np.float64), np.asarray(cam.K), np.asarray(cam.dist)).reshape(-1, 2)
+    R, t = T[:3, :3], T[:3, 3]
+    c = -R.T @ t
+    d = (R.T @ np.c_[rays, np.ones(4)].T).T
+    return (c + ((0 - c[2]) / d[:, 2])[:, None] * d)[:, :2]
+
+
 def result_text():
     if S.result is None:
         return "Not calibrated: capture the board lying flat on the table, seen by both cameras."
@@ -855,9 +874,9 @@ def root():
         with scene:
             add = scene_objs["static"].append
             add(scene.axes_helper(0.1))
-            w, h = (cols - 1) * sq * m, (rows - 1) * sq * m
-            for a, b in (((0, 0), (w, 0)), ((w, 0), (w, h)), ((w, h), (0, h)), ((0, h), (0, 0))):
-                add(scene.line([a[0], a[1], 0], [b[0], b[1], 0]).material("#d4d4d8"))
+            outline = board_outline() * m
+            for a, b in zip(outline, np.roll(outline, -1, axis=0)):
+                add(scene.line([float(a[0]), float(a[1]), 0], [float(b[0]), float(b[1]), 0]).material("#d4d4d8"))
             for name, color in (("left", "#d97706"), ("right", "#7c3aed")):
                 cam, T = pieces.camera_table_pose(S.calib, name)
                 Tinv = np.linalg.inv(T)
@@ -900,8 +919,7 @@ def root():
         pts = [((st if st is not None else p.table_mm)[0], (st if st is not None else p.table_mm)[1])
                for p, st in det_state.get("matched", [])]
         if not pts:
-            cols, rows = S.pattern
-            pts = [(0, 0), ((cols - 1) * S.square, (rows - 1) * S.square)]
+            pts = board_outline()
         pts = np.array(pts) * 1e-3
         mid, size = pts.mean(0), max(np.ptp(pts, 0).max(), 0.1)
         scene.move_camera(float(mid[0]) + 0.6 * size, float(mid[1]) - 1.2 * size, 1.2 * size,
