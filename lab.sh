@@ -141,6 +141,13 @@ cmd_arm() {
                 if "$SELF" cmd '{"op": "wake"}'; then echo "ARM AWAKE"; else echo "ARM NOT READY: it didn't wake up, see the reason above."; fi
                 exit 0
             fi
+            # the driver died (motors not answering, torque left on): the spawner would wait for it for ever
+            if ! pgrep -f ros2_control_node >/dev/null; then
+                echo "ARM NOT READY: the arm's driver (ros2_control_node) stopped. The reason is above 'process has died':
+    'Torque is enabled, cannot proceed': hold the arm, switch its power off and on, start again.
+    'There is no status packet' / 'Cannot connect': the arm's power, and the cable from the USB adapter to the motors."
+                exit 0
+            fi
             sleep 2
         done
         echo "ARM NOT READY: the controllers aren't active, check the errors above.
