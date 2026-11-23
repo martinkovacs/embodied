@@ -128,6 +128,18 @@ Fix anything that says FAIL. *Spoken answers* can stay a warning today.
 The arm stops above each piece. Answer whether the fingertips are really above it. If it goes somewhere completely
 different, the (0, 0) corner in step 5 was the wrong one: redo step 5.
 
+**One piece at a time, by hand:** close `calib_app.py` (only one program can use the cameras), then
+
+```bash
+./lab.sh python robot_app.py
+```
+
+Open <http://localhost:8082>. Detection tab: switch **Live detection** on. Robot tab: click a piece, then **Hover**,
+or **Pick** and then a free spot and **Place**. **Air** is on at every start: the arm then stops 40 mm above the
+piece and grips nothing. Switch it off for a real pick. A greyed-out button has its reason under *Target*
+("Pick is off: …"). Every click, command and answer, with the reason when something is refused, is written to the
+terminal and to `logs/robot_app.log`.
+
 ## 9. Dry run
 
 ```bash
@@ -196,6 +208,7 @@ The first one that is missing shows where the start broke:
 | No motor LED blinks once when the power is switched on | Power supply or the cable chain between the motors, not software |
 | `home` refuses, "cannot be lifted by a command" | Take the pieces near the arm away, then `./lab.sh cmd '{"op": "wake"}'` |
 | The arm doesn't rise after `ARM SIDE READY` | Read the reason printed there. "controller not running": power and USB of the arm, then restart `./lab.sh arm` |
+| The arm doesn't go to a piece, or Pick is greyed out (`robot_app.py`) | Read "Pick is off: …" under *Target*, or the last lines of `logs/robot_app.log`. `out of reach … mm from the base axis`: keep pieces about 100 to 210 mm from the arm's base. `not within 25 mm of a piece BOTH cameras see`: only pieces both cameras find can be picked; Live detection on, better light or thresholds. The arm side's own answer (`cmd:` and `"failed"` lines) is in the `./lab.sh arm` terminal |
 | A camera won't open | Close `calib_gui.py`. Only one program can use a camera at a time |
 | "Cameras found: none" for the Basler cameras (USB) | `echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="2676", MODE="0666"' \| sudo tee /etc/udev/rules.d/69-basler.rules`, then `sudo udevadm control --reload-rules`, and replug them |
 | Basler cameras not found (network models) | They need an IP on the PC's network: ask the lab staff, or set it in Basler's pylon Viewer |
