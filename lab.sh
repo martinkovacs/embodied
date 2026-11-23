@@ -25,12 +25,25 @@ OMX_BUILD=(open_manipulator_x_bringup dynamixel_hardware_interface)
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-omx_ws() {  # the workspace holding the ROBOTIS packages, if there is one
+omx_ws() {  # the workspace holding the ROBOTIS packages the arm's driver needs, if there is one
     local w
-    for w in "${OMX_WS:-}" "$HOME/omx_ws" "$HOME/ros2_ws" "$HOME/colcon_ws" "$HOME/robotis_ws" /opt/omx_ws; do
-        if [ -n "$w" ] && [ -d "$w/install/open_manipulator_x_bringup" ]; then echo "$w"; return; fi
+    for w in "${OMX_WS:-}" "$HOME/omx_ws" "$HOME/manipulator_ws" "$HOME/ros2_ws" "$HOME/colcon_ws" "$HOME/robotis_ws" \
+             /opt/omx_ws; do
+        if [ -n "$w" ] && [ -f "$w/install/open_manipulator_x_bringup/share/open_manipulator_x_bringup/launch/hardware.launch.py" ] \
+            && [ -d "$w/install/dynamixel_hardware_interface" ]; then echo "$w"; return; fi
     done
 }
+
+no_venv() {  # run a ROS build with the system Python (3.10, with ROS's own modules), never a virtualenv's
+    local p=":$PATH:" v
+    for v in "${VIRTUAL_ENV:-}" "$PWD/venv"; do
+        if [ -n "$v" ]; then p=${p//:$v\/bin:/:}; fi
+    done
+    p=${p#:}
+    env -u VIRTUAL_ENV -u PYTHONHOME PATH="${p%:}" "$@"
+}
+# CMake keeps the Python it found in its cache: name it, so an earlier run from inside a venv doesn't stick
+SYSTEM_PY=(-DPython3_EXECUTABLE=/usr/bin/python3 -DPYTHON_EXECUTABLE=/usr/bin/python3)
 
 source_ros() {
     [ -f /opt/ros/humble/setup.bash ] || die "ROS 2 Humble isn't installed in /opt/ros/humble. Ask the lab staff."
@@ -67,7 +80,8 @@ cmd_setup() {
         for r in "${ROBOTIS[@]}"; do
             [ -d "$HOME/omx_ws/src/$r" ] || git clone --depth 1 -b humble "https://github.com/ROBOTIS-GIT/$r.git" "$HOME/omx_ws/src/$r"
         done
-        (cd "$HOME/omx_ws" && colcon build --packages-up-to "${OMX_BUILD[@]}" --cmake-args -DCMAKE_BUILD_TYPE=Release)
+        (cd "$HOME/omx_ws" && no_venv colcon build --packages-up-to "${OMX_BUILD[@]}" \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release "${SYSTEM_PY[@]}")
         source_ros
     else
         echo "== ROBOTIS packages: found in $w"
@@ -76,11 +90,16 @@ cmd_setup() {
     echo "== Python environment (venv/)"
     export PATH="$HOME/.local/bin:$PATH"
     command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+    # a venv made with the system's python3 (3.10) is too old for our code: make it again
+    if [ -x venv/bin/python ] && ! env -u PYTHONPATH venv/bin/python -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+        echo "venv/ is $(env -u PYTHONPATH venv/bin/python -V 2>&1), too old: making it again with Python $PYTHON"
+        rm -rf venv
+    fi
     [ -x venv/bin/python ] || env -u PYTHONPATH uv venv --python "$PYTHON" --seed venv
     env -u PYTHONPATH uv pip install --python venv/bin/python -r requirements.txt
 
     echo "== Building ros_ws"
-    (cd ros_ws && colcon build --symlink-install)
+    (cd ros_ws && no_venv colcon build --symlink-install --cmake-args "${SYSTEM_PY[@]}")
 
     echo "== Self-tests (about a minute)"
     "$SELF" python runner.py --self-test | tail -1
