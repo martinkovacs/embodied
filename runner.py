@@ -210,7 +210,8 @@ class Vision:
             with ThreadPoolExecutor(2) as pool:     # OpenCV releases the GIL: both cameras at once
                 pl, pr = pool.map(lambda iv: pieces.detect_pieces(iv[0], iv[1], params=self.params),
                                   ((left, self.views[0]), (right, self.views[1])))
-            found = pieces.matched_pieces(self.calib, pl, pr, max_mm=self.params["match_mm"])
+            found = pieces.matched_pieces(self.calib, pl, pr, max_mm=self.params["match_mm"],
+                                           max_dz=self.params["max_dz_mm"])
         # only pieces both cameras agree on: one camera alone is where false detections come from
         return [(p.color, float(st[0]), float(st[1])) for p, st in found if st is not None], (left, right)
 

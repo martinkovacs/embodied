@@ -399,11 +399,11 @@ class Engine:
 
     def teach(self, side, kind, u, v, color=None):
         """A click on a piece's top in a picture (kind "cam": camera pixel, "top": top-view pixel): widen its
-        colour's thresholds so it passes, and if the latest detection has a near miss there, lower the rim / fill
-        minimum that keeps it out (not below 0.3). Fast: the detection thread shows the result. Returns a message;
-        raises ValueError if the spot isn't a coloured piece."""
+        colour's thresholds so it passes, lower the rim / fill minimum that keeps that piece out (not below 0.3), and
+        say what still does (pieces.probe). The detection thread shows the result. Returns a message; raises
+        ValueError if the spot isn't a coloured piece."""
         with self.lock:
-            det, views, frames = self.det, self.views, self.frames
+            views, frames = self.views, self.frames
             params = copy.deepcopy(self.params)
         if views is None:
             raise ValueError("calibrate first")
@@ -412,7 +412,7 @@ class Engine:
         if img is None:
             raise ValueError("no picture yet")
         if kind == "top":
-            r, at = pieces.PIECE_D_MM / 2 * view.ppm, (lambda p: p.view_uv)
+            r = pieces.PIECE_D_MM / 2 * view.ppm
             color, changed = pieces.teach(view.warp(img), u, v, r, params, color)
         else:
             x, y = view.view_to_table(*view.image_to_view(u, v))
@@ -420,19 +420,33 @@ class Engine:
             ring = view.project(np.c_[x + pieces.PIECE_D_MM / 2 * np.cos(ang), y + pieces.PIECE_D_MM / 2 * np.sin(ang),
                                       np.full(16, view.z)])
             r = float(np.clip(np.hypot(ring[:, 0] - u, ring[:, 1] - v).min(), 4, 150)) if np.isfinite(ring).all() else 15.0
-            at = lambda p: p.image_uv
             color, changed = pieces.teach(img, u, v, r, params, color)
-        near = [m for m in (det["misses"][i] if det else []) if np.hypot(at(m)[0] - u, at(m)[1] - v) < 1.5 * r]
-        if near:
-            for key, score in (("min_rim", near[0].rim), ("min_fill", near[0].fill)):
+        # this piece's own scores with the widened colours: lower the rim / fill minimum it misses (not below 0.3),
+        # and say what still keeps it out
+        top = view.warp(img)
+        tu, tv = (u, v) if kind == "top" else view.image_to_view(u, v)
+        pr = pieces.probe(top, view, tu, tv, params)
+        if pr is not None and pr["fill"] >= 0.4:
+            for key, score in (("min_rim", pr["rim"]), ("min_fill", pr["fill"])):
                 new = max(0.3, round(score - 0.05, 2))
                 if new < params[key]:
                     changed.append(f"{key} {params[key]:.2f} → {new:.2f}")
                     params[key] = new
+            pr = pieces.probe(top, view, tu, tv, params)
         with self.lock:
             self.params = params
             self.params_id += 1
-        return f"{color}: {', '.join(changed) or 'no change needed'}"
+        msg = f"{color}: {', '.join(changed) or 'no change needed'}"
+        if pr is None:
+            return msg + ". No piece colour found around the click"
+        msg += (f". This piece in the {side} camera: fill {pr['fill']:.2f}, rim {pr['rim']:.2f}, around "
+                f"{pr['around']:.2f}: " + ("passes" if not pr["fails"] else "still out, " + ", ".join(pr["fails"])))
+        if any(f.startswith("rim") for f in pr["fails"]):
+            msg += (". Its outline is too weak in the picture: lower 'edges ≥' (now the strongest "
+                    f"{100 - params['edge_pct']:.0f} % of edges count), or switch on 'Outline from the mask too'")
+        if any(f.startswith("around") for f in pr["fails"]):
+            msg += ". Too much of its colour around it: raise 'around ≤', or narrow the colour (S, V, hue)"
+        return msg
 
 
 def seen_by(view, xyz):
@@ -458,7 +472,7 @@ def detect(frames, views, calib, params):
     # the background, walls and cloth come in)
     pl = [p for p in pl if seen_by(views[1], p.table_mm)]
     pr = [q for q in pr if seen_by(views[0], q.table_mm)]
-    matched = pieces.matched_pieces(calib, pl, pr, max_mm=params["match_mm"])
+    matched = pieces.matched_pieces(calib, pl, pr, max_mm=params["match_mm"], max_dz=params["max_dz_mm"])
     paired = set()
     for p, st in matched:
         if st is not None:      # its right partner: same colour, nearest on the table
@@ -924,10 +938,28 @@ def threshold_sliders(E):
             with ui.row().classes("w-full items-center no-wrap gap-2"):
                 ui.label(label).classes("text-xs w-14")
                 widgets[key] = ui.slider(min=0.2, max=1.0, step=0.05, value=E.params[key]).props("label").classes("flex-1")
+        ui.label("outline (rim)").classes("text-sm font-medium mt-1")
+        widgets["mask_edges"] = ui.switch("Outline from the mask too", value=E.params["mask_edges"]).props("dense") \
+            .tooltip("The edge of the colour mask counts as the piece's outline too: a piece the mask shows well is "
+                     "found even where the picture has no sharp edge")
+        for key, label, lo, hi, step in (("edge_pct", "edges ≥ %", 50, 98, 1), ("rim_band", "band ±", 0.04, 0.3, 0.02),
+                                         ("size", "size ×", 0.8, 1.25, 0.01)):
+            with ui.row().classes("w-full items-center no-wrap gap-2"):
+                ui.label(label).classes("text-xs w-14")
+                widgets[key] = ui.slider(min=lo, max=hi, step=step, value=E.params[key]).props("label").classes("flex-1")
+        ui.label("Edges ≥: an edge counts as outline if it is stronger than this share of all edges in the picture (90: "
+                 "the strongest 10 %). A busy background (carpet) raises the bar for every piece: lower finds softer "
+                 "outlines. Band: how far from the expected radius an edge may lie. Size: the top's radius the detector "
+                 "looks for (1 = 35 mm); try it if the circles sit too big or too small on the pieces.") \
+            .classes("text-xs opacity-60")
         ui.label("stereo").classes("text-sm font-medium mt-1")
         with ui.row().classes("w-full items-center no-wrap gap-2"):
             ui.label("match ≤ mm").classes("text-xs w-14")
             widgets["match_mm"] = ui.slider(min=5, max=40, step=1, value=E.params["match_mm"]).props("label").classes("flex-1")
+        with ui.row().classes("w-full items-center no-wrap gap-2"):
+            ui.label("height ± mm").classes("text-xs w-14")
+            widgets["max_dz_mm"] = ui.slider(min=5, max=45, step=1, value=E.params["max_dz_mm"]).props("label") \
+                .classes("flex-1").tooltip("How far from the top-face height the two cameras' sighting may be")
         ui.label("How far apart the two cameras may put the same piece and still pair it. Grey pieces with ? say how "
                  "far the other camera's sighting is: if that is more than a few mm everywhere, the calibration is off "
                  "(capture the board on the table again, add lens views); raising this is the quick fix.") \
@@ -946,6 +978,8 @@ def threshold_sliders(E):
             if isinstance(key, tuple):
                 name, k = key
                 p["colors"][name][k] = (int(value["min"]), int(value["max"])) if k == "h" else int(value)
+            elif key == "mask_edges":
+                p[key] = bool(value)
             else:
                 p[key] = float(value)
         E.set_param(put)
