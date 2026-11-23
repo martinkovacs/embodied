@@ -200,6 +200,28 @@ def wake_moves(q, table_z=0.0, op_xy=None):
         return [wake_path(q)]
 
 
+JOG_MAX = 0.2                   # rad: the largest single keyboard step
+
+
+def jog(q, joint, delta, table_z=0.0):
+    """Joint `joint` (1-4) turned by `delta` rad from q, for keyboard control. ValueError if the step leaves the joint's
+    limits, or brings the fingertips under GRASP_Z over the table or the arm closer to itself than SELF_CLEAR (a step
+    that moves away from either is allowed, so a low or folded arm can always be jogged back out)."""
+    if joint not in (1, 2, 3, 4) or not abs(delta) <= JOG_MAX:      # fail closed: nan can't pass
+        raise ValueError(f"jog: joint 1-4 and |delta| <= {JOG_MAX} rad, got joint {joint!r}, delta {delta!r}")
+    to = list(q)
+    lo, hi = LIMITS[joint - 1]
+    to[joint - 1] = min(max(q[joint - 1] + delta, lo), hi)      # a step past the limit stops at it
+    if abs(to[joint - 1] - q[joint - 1]) < 1e-3:
+        raise ValueError(f"joint{joint} is at its limit ({lo:.2f} .. {hi:.2f} rad)")
+    low_now, low = fk(q)[2] - table_z, path_min_z(q, to) - table_z
+    if low < GRASP_Z and low < low_now:
+        raise ValueError(f"fingertips would go down to {low:.0f} mm over the table (lowest allowed {GRASP_Z:.0f} mm)")
+    if self_gap(to) < SELF_CLEAR and self_gap(to) < self_gap(q):
+        raise ValueError("the gripper would come too close to the arm's own base or upper arm")
+    return to
+
+
 if __name__ == "__main__":
     assert max(abs(a - b) for a, b in zip(fk((0, 0, 0, 0)), (J1_X + UP_X + FOREARM + TOOL, 0, J2_Z + UP_Z))) < 1e-9
     assert CLEAR <= LIFT
@@ -291,4 +313,17 @@ if __name__ == "__main__":
     assert wake_moves(low) == [lift_path(low, 0.0), [HOME]]
     lying = (0.0, 1.5, -1.2, -0.2)                              # one it can't: joint by joint
     assert wake_moves(lying) == [wake_path(lying)]
+
+    assert jog(home, 1, 0.1) == [0.1, *HOME[1:]]                # keyboard: a plain step turns one joint
+    assert jog((3.1, *HOME[1:]), 1, 0.1)[0] == pi               # the step past a limit ends on it...
+    for args in ((home, 2, 0.3), (home, 5, 0.1), (home, 1, float("nan")), ((pi, *HOME[1:]), 1, 0.1),
+                 (ik(J1_X + 150.0, 0.0, GRASP_Z + 2.0), 2, 0.05)):   # too big, no joint, nan, ...the next one is
+                                                                    # refused, into the table
+        try:
+            jog(*args)
+        except ValueError:
+            continue
+        raise AssertionError(f"jog{args[1:]} should be refused")
+    low = ik(J1_X + 150.0, 0.0, GRASP_Z + 2.0)                  # already low: a step up is still allowed
+    assert fk(jog(low, 2, -0.05))[2] > fk(low)[2]
     print("kinematics ok")

@@ -41,7 +41,7 @@ import calib_app as ca
 import pieces
 import robot_frame      # first: puts ros_ws/src/arm_node on sys.path
 from arm_node.kinematics import (FOREARM, GRASP_Z, HOME, J1_X, J2_Z, LIFT, PLACE_Z, SHOW, TOOL, UP_X, UP_Z,  # noqa: E402
-                                 fk, ik, travel_moves, vertical, wake_moves)
+                                 fk, ik, jog, travel_moves, vertical, wake_moves)
 from calib_app import SIDES, Engine
 from cameras import ROOT
 
@@ -56,7 +56,9 @@ STOP_CONFIRM_S = 8.0                    # arm_node's worst case to confirm a sto
 JOINT_STALE_S = 1.0
 SNAP_MM = 25.0                          # a click this close to a detected piece means that piece
 SPACING_MM = 40.0                       # runner.py's: room for the open fingers between pieces
-MOVES = ("home", "show", "pick", "place", "wake")   # what "air" slows down (hover is always slow)
+MOVES = ("home", "show", "pick", "place", "wake")   # what "air" slows down (hover and jog are always slow)
+JOG_STEP = 0.1                          # rad per key press (arm_node allows up to kinematics.JOG_MAX)
+JOG_KEYS = {"1": (1, 1), "q": (1, -1), "2": (2, 1), "w": (2, -1), "3": (3, 1), "e": (3, -1), "4": (4, 1), "r": (4, -1)}
 LOG = ROOT / "logs" / "robot_app.log"
 
 
@@ -246,10 +248,14 @@ class SimLink:
 
     def _do(self, cmd):
         op, air = cmd["op"], bool(cmd.get("air"))
-        speed = AIR_SPEED if air or op in ("hover", "wake") else MAX_SPEED
+        speed = AIR_SPEED if air or op in ("hover", "wake", "jog") else MAX_SPEED
         q = list(self.q)
         if op == "open":
             return self._grip(OPEN)
+        if op == "close":
+            return self._grip(CLOSED)
+        if op == "jog":
+            return self._moves([[jog(q, int(cmd["joint"]), float(cmd["delta"]), self.table_z)]], speed)
         if op in ("home", "show"):
             return self._moves(travel_moves(q, HOME if op == "home" else SHOW, self.table_z, self.op_xy), speed)
         if op == "wake":
@@ -377,13 +383,14 @@ class Robot:
     def can_move(self):
         return self.link.connected and not self.busy and not self.torque_off
 
-    async def do(self, op, xy=None):
-        """Send one command and wait for its answer; RuntimeError with the reason if it failed."""
+    async def do(self, op, xy=None, **fields):
+        """Send one command (fields: extra ones, e.g. a jog's joint and delta) and wait for its answer; RuntimeError
+        with the reason if it failed."""
         if self.busy:
             raise RuntimeError(f"still running: {self.busy}")
         if self.torque_off:
             raise RuntimeError("torque is off: restart ./lab.sh arm first")
-        cmd, what = {"op": op}, op
+        cmd, what = {"op": op, **fields}, " ".join([op, *(f"{k} {v}" for k, v in fields.items())])
         if xy is not None:
             if self.T is None:
                 raise RuntimeError("no table → robot fit yet")
@@ -569,6 +576,8 @@ def build_ui(E: Engine, R: Robot):
                 arm3d.tick()
             elif tab == t_rob.props["name"]:
                 rob.tick()
+            if tab != t_rob.props["name"]:
+                rob.kb.value = False    # the arm's keys only work where its state and STOP are on screen
         ui.timer(0.2, tick)
 
 
@@ -617,8 +626,14 @@ def robot_panel(E: Engine, R: Robot):
                     b_show = ui.button("Show", icon="front_hand", on_click=lambda: cmd("show")).props("dense") \
                         .tooltip("Hold the gripper out to the participant, as for a question")
                     b_open = ui.button("Open gripper", icon="open_in_full", on_click=lambda: cmd("open")).props("dense")
+                    b_close = ui.button("Close gripper", icon="close_fullscreen", on_click=lambda: cmd("close")) \
+                        .props("dense")
                 b_stop = ui.button("STOP", icon="pan_tool", on_click=lambda: stop()) \
                     .props("color=negative size=lg").classes("w-full")
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    kb = ui.switch("Keyboard").tooltip("Off by itself when you leave this tab")
+                    ui.label(f"1/q 2/w 3/e 4/r: joint 1-4 ± {JOG_STEP:.2f} rad · o/p: open/close gripper · h: home · "
+                             "Esc: STOP").classes("text-xs opacity-70")
 
             with ui.card().classes("w-full gap-2"):
                 ui.label("Move a piece").classes("text-base font-medium")
@@ -653,6 +668,26 @@ def robot_panel(E: Engine, R: Robot):
             log(f"{op} FAILED: {e}")
             ui.notify(f"{op} failed: {e}", type="negative", multi_line=True)
             return False
+
+    async def key(e):
+        """Keyboard control (the Keyboard switch): a held key repeats, but a step only starts once the last one ended."""
+        if not kb.value or not e.action.keydown:
+            return
+        if e.key.escape:               # not space: it would also flip a focused switch
+            return await stop()
+        k = e.key.name.lower()
+        if R.busy or not R.can_move:
+            return
+        if k in JOG_KEYS:
+            joint, sign = JOG_KEYS[k]
+            try:
+                await R.do("jog", joint=joint, delta=sign * JOG_STEP)
+            except Exception as err:
+                log(f"jog FAILED: {err}")
+                ui.notify(f"jog failed: {err}", type="negative", multi_line=True)
+        elif k in ("o", "p", "h") and not e.action.repeat:
+            await cmd({"o": "open", "p": "close", "h": "home"}[k])
+    ui.keyboard(key, ignore=["input", "select", "textarea"])
 
     def why_not(op):
         """None if the op's button works now, else why it is greyed out."""
@@ -689,6 +724,7 @@ def robot_panel(E: Engine, R: Robot):
     async def stop():
         ok, why = await R.stop()
         R.last = "stop: confirmed" if ok else f"stop: NOT confirmed ({why})"
+        log(R.last)
         if ok:
             ui.notify("Stopped", type="warning")
         else:
@@ -808,7 +844,7 @@ def robot_panel(E: Engine, R: Robot):
             torque_banner.set_visibility(R.torque_off)
             air_note.text = "" if R.air else "REAL moves: picks grip, places let go"
             air_note.classes(replace="text-sm text-red-400 font-medium")
-            for b in (b_wake, b_home, b_show, b_open):
+            for b in (b_wake, b_home, b_show, b_open, b_close):
                 b.set_enabled(R.can_move)
             b_stop.set_enabled(R.link.connected)
             for b, op in ((b_hover, "hover"), (b_pick, "pick"), (b_place, "place")):
@@ -829,7 +865,9 @@ def robot_panel(E: Engine, R: Robot):
             if svg != shown["svg"]:
                 shown["svg"] = svg
                 img.content = svg
-    return Panel()
+    panel = Panel()
+    panel.kb = kb
+    return panel
 
 
 def fit_section(E: Engine, R: Robot):

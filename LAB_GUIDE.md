@@ -140,6 +140,13 @@ piece and grips nothing. Switch it off for a real pick. A greyed-out button has 
 ("Pick is off: …"). Every click, command and answer, with the reason when something is refused, is written to the
 terminal and to `logs/robot_app.log`.
 
+**Keyboard:** switch **Keyboard** on in the Robot tab (it switches itself off when you leave the tab). Each press
+turns one joint by 0.1 rad, slowly: `1`/`q` joint 1 (base, left/right), `2`/`w` joint 2, `3`/`e` joint 3,
+`4`/`r` joint 4 (wrist). `o` opens the gripper, `p` closes it, `h` goes home, **Esc** stops. A step past a joint's
+limit, into the table or into the arm itself is refused, with the reason on screen and in the log. **Close
+gripper** is also a button. After `./lab.sh arm` was restarted with this version, the arm side knows the new
+commands; an older arm side answers `unknown op 'jog'`.
+
 ## 9. Dry run
 
 ```bash

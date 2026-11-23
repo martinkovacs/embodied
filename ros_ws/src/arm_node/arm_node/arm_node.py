@@ -2,7 +2,9 @@
 
 /arm/cmd     std_msgs/String JSON  {"id": 7, "op": "pick", "x": 120, "y": -40}   x, y: robot base frame (link1), mm
               z: table surface height at (x, y), mm, required for pick/place (GRASP_Z etc. are heights above it)
-             op: pick | place | hover (x, y, z) | show | home | open | stop | wake
+             op: pick | place | hover (x, y, z) | show | home | open | close | jog (joint, delta) | stop | wake
+             jog: keyboard control, joint 1-4 turned by delta rad (|delta| <= kinematics.JOG_MAX), slowly; refused
+                  past a joint limit, into the table or into the arm itself (kinematics.jog)
              air: true (optional) makes a dry run of the command: slow, pick / place stop AIR_MM above the piece
              hover: the fingertips go to the approach height over (x, y), always slowly, and stay there
              wake: slowly up to home from wherever the arm lies, never lower than it is: straight up like a home
@@ -37,7 +39,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from arm_node.kinematics import GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, travel_moves, vertical, wake_moves
+from arm_node.kinematics import GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, jog, travel_moves, vertical, wake_moves
 
 JOINTS = ["joint1", "joint2", "joint3", "joint4"]
 OPEN, CLOSED = 0.019, -0.01     # gripper_left_joint limits, m; closing on a piece just stalls on it
@@ -213,7 +215,7 @@ class ArmNode(Node):
 
     async def run(self, cmd):
         op, air = cmd["op"], bool(cmd.get("air"))
-        self.speed = AIR_SPEED if air or op in ("hover", "wake") else MAX_SPEED
+        self.speed = AIR_SPEED if air or op in ("hover", "wake", "jog") else MAX_SPEED
         if op == "home":
             await self.travel(HOME, self.table_z)
         elif op == "wake":
@@ -223,6 +225,10 @@ class ArmNode(Node):
             await self.travel(SHOW, self.table_z)
         elif op == "open":
             await self.grip(OPEN)
+        elif op == "close":
+            await self.grip(CLOSED)
+        elif op == "jog":
+            await self.move([jog(self.joints(), int(cmd["joint"]), float(cmd["delta"]), self.table_z)])
         elif op == "hover":
             if cmd.get("z") is None:
                 raise ValueError("hover needs z (table surface height at (x, y) in the robot frame, mm)")
