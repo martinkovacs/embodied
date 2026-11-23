@@ -14,5 +14,7 @@ models/
 
 # calibration images: big, and specific to one lab session
 calib_data/pairs/
+# debug snapshots (Detection tab): pictures, big
+calib_data/debug/
 # what calib_gui.py saves in test mode
 synthetic/gui/

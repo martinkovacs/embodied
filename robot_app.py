@@ -1052,13 +1052,12 @@ class Arm3D:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--files", nargs=2, metavar=("LEFT", "RIGHT"),
-                    help="image files instead of cameras: comma-separated globs per camera (development)")
+    ca.add_source_args(ap)
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--host", default="localhost", help="rosbridge host (port 9090)")
     ap.add_argument("--fake-arm", action="store_true", help="a simulated arm instead of ROS (development)")
     args = ap.parse_args()
-    E = Engine(tuple(args.files) if args.files else None)
+    E = ca.engine_from_args(args)
     try:
         E.connect()
     except Exception as e:

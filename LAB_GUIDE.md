@@ -208,7 +208,7 @@ The first one that is missing shows where the start broke:
 | `/dev/ttyUSB0 doesn't exist` | Check the arm's USB cable and power |
 | `no permission on /dev/ttyUSB0` | `./lab.sh usb` (installs the USB rule, asks for the sudo password) |
 | The arm is jerky, or the controllers don't start | `cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer` must print `1`. If not: `./lab.sh usb` |
-| `ARM NOT READY: the controllers aren't active` | Look above it for `Torque is enabled, cannot proceed`: hold the arm, switch its power off and on, start again. `Cannot connect` or no motor found: the arm's power and the cable from the USB adapter to the motors |
+| `ARM NOT READY: the controllers aren't active` or `the arm's driver (ros2_control_node) stopped` | Look above it for `Torque is enabled, cannot proceed` (a crashed or killed start leaves the torque on, and Ctrl-C can't release it then): hold the arm, `./lab.sh torque-off` (or switch its power off and on), start again. `Cannot connect` or no motor found: the arm's power and the cable from the USB adapter to the motors |
 | `the ROS side is already running` | Ctrl-C in the terminal that runs `./lab.sh arm` or `./lab.sh run`, wait a few seconds |
 | `the arm did not get there` | A motor gave up. If a motor LED blinks: overload, switch the arm's power off and on, then restart. Otherwise something blocks the arm |
 | `joints ... are outside their limits` | The arm lies past an end stop: `./lab.sh torque-off`, move it a little by hand, restart `./lab.sh arm` |

@@ -144,14 +144,14 @@ cmd_arm() {
             # the driver died (motors not answering, torque left on): the spawner would wait for it for ever
             if ! pgrep -f ros2_control_node >/dev/null; then
                 echo "ARM NOT READY: the arm's driver (ros2_control_node) stopped. The reason is above 'process has died':
-    'Torque is enabled, cannot proceed': hold the arm, switch its power off and on, start again.
+    'Torque is enabled, cannot proceed': hold the arm, ./lab.sh torque-off (or switch its power off and on), start again.
     'There is no status packet' / 'Cannot connect': the arm's power, and the cable from the USB adapter to the motors."
                 exit 0
             fi
             sleep 2
         done
         echo "ARM NOT READY: the controllers aren't active, check the errors above.
-    'Torque is enabled, cannot proceed': hold the arm, switch its power off and on, start again.
+    'Torque is enabled, cannot proceed': hold the arm, ./lab.sh torque-off (or switch its power off and on), start again.
     'Cannot connect' / no motor found: the arm's power, and the cable from the USB adapter to the motors."
     ) &
     wait "$launch" || true
@@ -225,9 +225,37 @@ cmd_cmd() {  # one /arm/cmd, then wait for its done / failed on /arm/status
 }
 
 cmd_torque_off() {
-    source_ros
-    ros2 service call /dynamixel_hardware_interface/set_dxl_torque std_srvs/srv/SetBool "{data: false}"
-    echo "Torque off: HOLD THE ARM, it can now fall. Afterwards restart ./lab.sh arm (don't turn torque back on)."
+    if [ -t 0 ]; then read -rp "HOLD THE ARM, then press Enter: its motors let go and it falls. "; fi
+    if pgrep -f ros2_control_node >/dev/null; then
+        source_ros
+        timeout 15 ros2 service call /dynamixel_hardware_interface/set_dxl_torque std_srvs/srv/SetBool "{data: false}" \
+            || die "the arm's driver didn't answer: switch the arm's power off (still holding it)"
+    else
+        # no driver (it refuses to start while a motor's torque is on, and a crashed one never turned it off):
+        # tell the motors directly, on the port the driver would use
+        [ -x venv/bin/python ] || die "run ./lab.sh setup first"
+        env -u PYTHONPATH venv/bin/python -c 'import dynamixel_sdk' 2>/dev/null \
+            || env -u PYTHONPATH venv/bin/python -m pip install -q dynamixel-sdk==4.1.0
+        env -u PYTHONPATH -u LD_LIBRARY_PATH venv/bin/python - "$PORT" <<'EOF' || die "torque is still on: switch the arm's power off (still holding it)"
+import sys
+from dynamixel_sdk import PacketHandler, PortHandler
+port, packets = PortHandler(sys.argv[1]), PacketHandler(2.0)
+try:
+    if not (port.openPort() and port.setBaudRate(1000000)):
+        raise OSError("no answer")
+except Exception as e:
+    sys.exit(f"can't open {sys.argv[1]} ({e}): is the arm's USB adapter plugged in, and ./lab.sh arm stopped?")
+bad = []
+for i in (11, 12, 13, 14, 15):      # joints 1-4 and the gripper; X series: Torque Enable is address 64
+    res, err = packets.write1ByteTxRx(port, i, 64, 0)
+    if res != 0 or err != 0:
+        bad.append(f"ID {i}: {packets.getTxRxResult(res) if res else packets.getRxPacketError(err)}")
+port.closePort()
+if bad:
+    sys.exit("these motors didn't take it: " + "; ".join(bad))
+EOF
+    fi
+    echo "Torque off: the arm can be moved by hand. Afterwards restart ./lab.sh arm (don't turn torque back on)."
 }
 
 cmd_python() {

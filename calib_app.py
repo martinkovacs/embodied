@@ -13,6 +13,9 @@ How it is built, so the UI stays simple:
     calib.json (calibration), detection.json (thresholds), settings.json (cameras, board), pairs/ (captures).
 
 Run:  ./lab.sh python calib_app.py                 (then open http://localhost:8080)
+      ./lab.sh python calib_app.py --snapshot calib_data/debug/20261123_171500.zip
+                                           (a debug snapshot, from the Detection tab's bug button: its pictures,
+                                           calibration and settings, as they were)
       ./lab.sh python calib_app.py --files 'synthetic/table_left.png,synthetic/scene_left.png' \\
                                            'synthetic/table_right.png,synthetic/scene_right.png'
                                            (image files instead of cameras, for development; < > step through them)
@@ -21,10 +24,14 @@ import argparse
 import copy
 import glob
 import json
+import shutil
+import subprocess
 import threading
+import zipfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -117,10 +124,12 @@ class Engine:
     """Cameras, captures, calibration and detection. Thread-safe: the UI calls in from its event loop (heavy calls
     through run.io_bound), the grab and detect threads run on their own."""
 
-    def __init__(self, files=None):
+    def __init__(self, files=None, data=None):
         self.settings = load_settings()
         self.files = files                  # (left patterns, right patterns) instead of cameras
-        self.data = FILES_DATA if files else DATA
+        self.data = Path(data) if data else FILES_DATA if files else DATA
+        if data and (self.data / "settings.json").exists():     # a snapshot: its board and cameras, not this PC's
+            self.settings |= json.loads((self.data / "settings.json").read_text())
         self.pairs = self.data / "pairs"
         self.table_file, self.calib_file = self.data / "table_pair.txt", self.data / "calib.json"
         self.params_file = self.data / "detection.json" if files else DETECTION_PATH
@@ -359,6 +368,76 @@ class Engine:
         d = (R.T @ np.c_[rays, np.ones(4)].T).T
         return (c + (-c[2] / d[:, 2])[:, None] * d)[:, :2]
 
+    # -- debug snapshot
+    def snapshot(self, note=""):
+        """Everything about the detection as it is now, to look at away from the lab: both camera pictures, the
+        calibration, the settings (saved or not), the detection drawn on the pictures, the colour masks, and a report
+        of every piece found, unpaired, outside the other camera's view, or nearly found. A folder in <data>/debug/
+        and a zip of it. Returns (zip path, one-line summary). Reopen it with --snapshot."""
+        with self.lock:
+            frames, calib, views = self.frames, self.calib, self.views
+            params = copy.deepcopy(self.params)
+        if frames[0] is None or frames[1] is None:
+            raise RuntimeError("no pictures: connect the cameras first")
+        if views is None or calib is None:
+            raise RuntimeError("calibrate first")
+        out = self.data / "debug" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        out.mkdir(parents=True, exist_ok=True)
+        for side, img in zip(SIDES, frames):
+            cv2.imwrite(str(out / f"{side}.png"), img)      # lossless: the detection runs on exactly these again
+        t0 = time.monotonic()
+        det = detect(frames, views, calib, params)          # on the saved pictures, not the live result
+        seconds = time.monotonic() - t0
+        calib.save(out / "calib.json")
+        pieces.save_params(out / "detection.json", params)
+        (out / "settings.json").write_text(json.dumps(self.settings, indent=2))
+
+        def info(p, why=None):
+            d = {"color": p.color, "table_mm": [round(float(v), 1) for v in p.table_mm],
+                 "image_px": [round(float(v), 1) for v in p.image_uv],
+                 "top_view_px": [round(float(v), 1) for v in p.view_uv],
+                 "rim": round(float(p.rim), 3), "fill": round(float(p.fill), 3), "around": round(float(p.around), 3)}
+            return d | ({"why": why} if why else {})
+        jpg = [cv2.IMWRITE_JPEG_QUALITY, 90]
+        cams = {}
+        for i, side in enumerate(SIDES):
+            img, view = frames[i], views[i]
+            found, alone, misses = det["found"][i], det["lone"][i], det["misses"][i]
+            outside = [p for p in det["raw"][i] if not any(p is q for q in found)]
+            notes = det["notes"] | {id(p): "outside the other camera's view" for p in outside}
+            everything = found + outside
+            vis = pieces.draw_misses(pieces.draw(img, everything, view, lone=alone + outside, notes=notes), misses, view)
+            cv2.imwrite(str(out / f"{side}_detection.jpg"), vis, jpg)
+            cv2.imwrite(str(out / f"{side}_top.jpg"),
+                        pieces.draw_top(det["tops"][i], everything, misses, view.ppm, alone + outside), jpg)
+            for color in params["colors"]:
+                cv2.imwrite(str(out / f"{side}_mask_{color}.jpg"), pieces.mask_view(img, params, color), jpg)
+            cams[side] = {"found_paired": [info(p) for p in found if not any(p is q for q in alone)],
+                          "unpaired": [info(p, det["notes"].get(id(p))) for p in alone],
+                          "outside_other_view": [info(p) for p in outside],
+                          "near_misses": [info(p) for p in misses]}
+        both = [{"color": p.color, "table_mm": [round(float(v), 1) for v in st]} for p, st in det["matched"] if st is not None]
+        summary = (f"{len(both)} piece(s) both cameras agree on; " + "; ".join(
+            f"{side}: {len(c['found_paired']) + len(c['unpaired'])} found, {len(c['unpaired'])} unpaired, "
+            f"{len(c['outside_other_view'])} outside the other view, {len(c['near_misses'])} near misses"
+            for side, c in cams.items()))
+        report = {"time": datetime.now().isoformat(timespec="seconds"), "note": note, "code": code_version(),
+                  "detection_seconds": round(seconds, 2), "summary": summary,
+                  "image_size": [int(frames[0].shape[1]), int(frames[0].shape[0])],
+                  "top_view": {"ppm": views[0].ppm, "plane_z_mm": views[0].z},
+                  "settings": {k: self.settings.get(k) for k in ("left", "right", "width", "height", "cols", "rows",
+                                                                "square_mm", "board_mm")},
+                  "params": params, "pieces_both_cameras": both, "cameras": cams}
+        (out / "report.json").write_text(json.dumps(report, indent=2, default=float))
+        (out / "README.txt").write_text(
+            f"Debug snapshot {out.name}\n{note}\n\n{summary}\n\n"
+            "left.png / right.png: the camera pictures. *_detection.jpg: coloured = both cameras agree, grey ? = one "
+            "camera only (why), thin grey with scores = near misses. *_top.jpg: the top view the detector works on. "
+            "*_mask_<colour>.jpg: what passes each colour's thresholds. report.json: all of it in numbers.\n"
+            f"Reopen: ./lab.sh python calib_app.py --snapshot {out}\n")
+        zip_path = shutil.make_archive(str(out), "zip", root_dir=out)
+        return Path(zip_path), summary
+
     # -- detection
     def _detect_loop(self):
         done = None
@@ -462,12 +541,14 @@ def seen_by(view, xyz):
 
 def detect(frames, views, calib, params):
     """Both cameras' pieces, paired: {"matched": [(left Piece, table xyz or None)], and per camera (left, right):
-    "found", "misses" (near misses), "tops" (top views), "lone" (pieces only that camera sees)}."""
+    "found", "misses" (near misses), "tops" (top views), "lone" (pieces only that camera sees), "raw" (found, before
+    dropping the ones outside the other camera's view)}."""
     def one(i):
         top, misses = views[i].warp(frames[i]), []
         return pieces.detect_pieces(frames[i], views[i], params=params, rejected=misses, top=top), misses, top
     with ThreadPoolExecutor(2) as pool:
         (pl, ml, tl), (pr, mr, tr) = pool.map(one, (0, 1))
+    raw = (pl, pr)
     # only where both cameras look: a detection the other camera can't see can never be confirmed (that's where
     # the background, walls and cloth come in)
     pl = [p for p in pl if seen_by(views[1], p.table_mm)]
@@ -486,7 +567,20 @@ def detect(frames, views, calib, params):
         for p in mine:
             d = [np.hypot(q.table_mm[0] - p.table_mm[0], q.table_mm[1] - p.table_mm[1]) for q in other if q.color == p.color]
             notes[id(p)] = f"{name} {min(d):.0f} mm away" if d else f"{name} sees none"
-    return {"matched": matched, "found": (pl, pr), "misses": (ml, mr), "tops": (tl, tr), "lone": lone, "notes": notes}
+    return {"matched": matched, "found": (pl, pr), "misses": (ml, mr), "tops": (tl, tr), "lone": lone, "notes": notes,
+            "raw": raw}
+
+
+def code_version():
+    """The git commit this runs, + "with changes" if files differ from it: which code a snapshot came from."""
+    try:
+        rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, capture_output=True,
+                               text=True, timeout=5).stdout.strip()
+        return (rev or "unknown") + (" with changes" if dirty else "")
+    except Exception:
+        return "unknown"
 
 
 # ---------------------------------------------------------------- pictures
@@ -812,6 +906,8 @@ def detection_panel(E):
                     "Grey circles with scores where something piece-like was rejected: which minimum keeps it out")
                 live = ui.switch("Live detection", value=True)
                 ui.button(icon="fullscreen", on_click=lambda: open_full()).props("flat dense").tooltip("Full screen")
+                ui.button(icon="bug_report", on_click=lambda: snap_dlg.open()).props("flat dense") \
+                    .tooltip("Debug snapshot: pictures, settings and detection in one zip, to send")
             with ui.row().classes("w-full no-wrap gap-2"):
                 imgs = {s: ui.interactive_image(events=["click"]).classes("w-full cursor-crosshair") for s in SIDES}
             ui.label("Coloured: a piece both cameras agree on (what the runner uses). One-camera (switch): grey with ?, "
@@ -838,6 +934,33 @@ def detection_panel(E):
             table = ui.table(columns=[{"name": "c", "label": "colour", "field": "c"},
                                       {"name": "xyz", "label": "table x, y, z mm", "field": "xyz"}],
                              rows=[]).props("dense flat").classes("w-full")
+
+    with ui.dialog() as snap_dlg, ui.card().classes("w-[560px] gap-2"):
+        ui.label("Debug snapshot").classes("text-base font-medium")
+        ui.label("Saves both camera pictures, the calibration, the current settings (saved or not), the detection drawn "
+                 "on the pictures, the colour masks and a report of every piece, as one zip to send.") \
+            .classes("text-sm opacity-70")
+        snap_note = ui.textarea("What's on the table, and what goes wrong?",
+                                placeholder="e.g. 12 pieces: 4 red, 4 blue, 4 green. Only 3 found; the blue ones never.") \
+            .classes("w-full").props("autogrow outlined")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=snap_dlg.close).props("flat")
+            snap_btn = ui.button("Save snapshot", icon="save")
+
+    async def save_snapshot():
+        snap_btn.props("loading")
+        try:
+            zip_path, summary = await run.io_bound(E.snapshot, snap_note.value or "")
+        except Exception as e:
+            ui.notify(f"No snapshot: {e}", type="negative", multi_line=True)
+            return
+        finally:
+            snap_btn.props(remove="loading")
+        snap_dlg.close()
+        snap_note.value = ""
+        ui.notify(f"Saved {zip_path}. {summary}", type="positive", multi_line=True, timeout=0, close_button=True)
+        ui.download(zip_path)       # into the browser's downloads too, ready to attach
+    snap_btn.on_click(save_snapshot)
 
     full = {"open": False, "pct": 100.0}
     with ui.dialog().props("maximized") as dlg, ui.card().classes("w-full h-full p-2 gap-2"):
@@ -1100,13 +1223,33 @@ def scene_panel(E):
     return Panel()
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_source_args(ap):
     ap.add_argument("--files", nargs=2, metavar=("LEFT", "RIGHT"),
                     help="image files instead of cameras: comma-separated globs per camera (development)")
+    ap.add_argument("--snapshot", metavar="DIR_OR_ZIP",
+                    help="open a debug snapshot (Detection tab, bug button): its pictures, calibration and settings")
+
+
+def engine_from_args(args):
+    if args.snapshot:
+        d = Path(args.snapshot).resolve()
+        if d.suffix == ".zip":                  # unpacked next to it, once
+            zipped, d = d, d.with_suffix("")
+            if not d.exists():
+                with zipfile.ZipFile(zipped) as z:
+                    z.extractall(d)
+        if not (d / "left.png").exists() or not (d / "calib.json").exists():
+            raise SystemExit(f"{d} isn't a debug snapshot (no left.png / calib.json)")
+        return Engine((str(d / "left.png"), str(d / "right.png")), data=d)
+    return Engine(tuple(args.files) if args.files else None)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_source_args(ap)
     ap.add_argument("--port", type=int, default=PORT)
     args = ap.parse_args()
-    E = Engine(tuple(args.files) if args.files else None)
+    E = engine_from_args(args)
     try:
         E.connect()
     except Exception as e:
