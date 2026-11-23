@@ -592,6 +592,9 @@ def robot_panel(E: Engine, R: Robot):
                 side = ui.toggle({"left": "Left", "right": "Right"}, value="left").props("dense")
                 ui.space()
                 hint = ui.label().classes("text-sm text-amber-300")
+                ui.label("A click:").classes("text-sm")
+                mode = ui.toggle({"move": "chooses a target", "fit": "names a board corner"}, value="move") \
+                    .props("dense").tooltip("Move a piece, or Table → robot fit")
             img = ui.interactive_image(events=["click"], sanitize=False).classes("w-full cursor-crosshair")
             ui.label("Coloured circles: pieces both cameras see. Yellow: the chosen piece, cyan: the chosen spot, orange "
                      "ring: the fingertips (with their height over the table), white dots: the fit points. Needs Live "
@@ -621,6 +624,8 @@ def robot_panel(E: Engine, R: Robot):
                 ui.label("Move a piece").classes("text-base font-medium")
                 ui.label("Click a piece in the picture to hover over it or pick it up, then click a free spot to put it "
                          "there. Home afterwards.").classes("text-xs opacity-60")
+                fit_mode_note = ui.label("A click now names a board corner for the fit: switch it to 'chooses a target' "
+                                         "above the picture.").classes("text-sm text-amber-400")
                 target = ui.label().classes("text-sm whitespace-pre-line")
                 holding = ui.label().classes("text-sm")
                 with ui.row().classes("gap-2"):
@@ -631,7 +636,11 @@ def robot_panel(E: Engine, R: Robot):
                     ui.button(icon="close", on_click=lambda: setattr(R, "target", None)).props("flat dense") \
                         .tooltip("Forget the target")
 
-            with ui.expansion("Table → robot fit", icon="architecture").classes("w-full bg-zinc-900 rounded") as fit_exp:
+            # opening the fit switches the clicks to corners, closing it back to targets; the toggle above the picture
+            # shows which, and overrides it
+            with ui.expansion("Table → robot fit", icon="architecture",
+                              on_value_change=lambda e: mode.set_value("fit" if e.value else "move")) \
+                    .classes("w-full bg-zinc-900 rounded"):
                 fit = fit_section(E, R)
 
     async def cmd(op, xy=None):
@@ -693,7 +702,7 @@ def robot_panel(E: Engine, R: Robot):
             return
         view = views[SIDES.index(side.value)]
         top, flat = click_to_table(view, kind.value, e.image_x, e.image_y)
-        if fit_exp.value:               # fit open: a click names the board corner the fingertips touch
+        if mode.value == "fit":         # a click names the board corner the fingertips touch
             fit.pick_corner(*flat)
             return
         d = E.det
@@ -778,7 +787,7 @@ def robot_panel(E: Engine, R: Robot):
                 circle((t["x"], t["y"], h), pieces.PIECE_D_MM / 2 + 6, "#facc15", 3, "target")
             else:
                 circle((t["x"], t["y"], 0.0), pieces.PIECE_D_MM / 2, "#22d3ee", 3, "put here", dash=True)
-        if fit_exp.value:
+        if mode.value == "fit":
             for i, (tab, _) in enumerate(R.points):
                 circle(tab, 3, "#ffffff", 2, str(i + 1))
             if fit.corner is not None:
@@ -804,7 +813,8 @@ def robot_panel(E: Engine, R: Robot):
             b_stop.set_enabled(R.link.connected)
             for b, op in ((b_hover, "hover"), (b_pick, "pick"), (b_place, "place")):
                 b.set_enabled(why_not(op) is None)
-            hint.text = ("Click the board corner the fingertips touch" if fit_exp.value else
+            fit_mode_note.set_visibility(mode.value == "fit")
+            hint.text = ("Click the board corner the fingertips touch" if mode.value == "fit" else
                          "Click a piece, or a free spot" if E.views is not None else "Calibrate first")
             fit.tick()
             d = E.det
