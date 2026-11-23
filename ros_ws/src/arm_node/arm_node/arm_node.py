@@ -118,6 +118,7 @@ class ArmNode(Node):
     async def on_cmd(self, msg):
         cmd = {}
         try:
+            self.get_logger().info(f"cmd: {msg.data}")     # with the reply lines: what was asked, and why it failed
             cmd = json.loads(msg.data)
             if cmd["op"] == "stop":
                 await self.on_stop(cmd)

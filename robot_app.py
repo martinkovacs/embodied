@@ -57,6 +57,19 @@ JOINT_STALE_S = 1.0
 SNAP_MM = 25.0                          # a click this close to a detected piece means that piece
 SPACING_MM = 40.0                       # runner.py's: room for the open fingers between pieces
 MOVES = ("home", "show", "pick", "place", "wake")   # what "air" slows down (hover is always slow)
+LOG = ROOT / "logs" / "robot_app.log"
+
+
+def log(msg):
+    """To the terminal and logs/robot_app.log: every click, command, answer, and why a move was refused."""
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    print(line, flush=True)
+    try:
+        LOG.parent.mkdir(exist_ok=True)
+        with LOG.open("a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d')} {line}\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- the arm's two stand-ins
@@ -381,6 +394,7 @@ class Robot:
             cmd["air"] = True
             what += " (air)"
         self.busy, self.last = what, f"{what}: running"
+        log(f"send {what}: {json.dumps(cmd)}")
         timeout = TIMEOUT_S.get(op, CMD_TIMEOUT_S)
         try:
             s = await asyncio.wait_for(asyncio.wrap_future(self.link.send(cmd)), timeout)
@@ -623,11 +637,33 @@ def robot_panel(E: Engine, R: Robot):
     async def cmd(op, xy=None):
         try:
             await R.do(op, xy)
+            log(R.last)
             ui.notify(R.last, type="positive")
             return True
         except Exception as e:
+            log(f"{op} FAILED: {e}")
             ui.notify(f"{op} failed: {e}", type="negative", multi_line=True)
             return False
+
+    def why_not(op):
+        """None if the op's button works now, else why it is greyed out."""
+        t = R.target
+        if not R.link.connected:
+            return "no rosbridge connection: is ./lab.sh arm running?"
+        if R.torque_off:
+            return "torque is off: hold the arm, restart ./lab.sh arm"
+        if R.busy:
+            return f"still running: {R.busy}"
+        if t is None:
+            return "no target: click a piece in the picture"
+        if why := R.reach(t["x"], t["y"]):
+            return why
+        if op == "pick" and t["kind"] != "piece":
+            return (f"the click is not within {SNAP_MM:.0f} mm of a piece BOTH cameras see (Live detection on? a "
+                    "piece seen by one camera only can't be picked)")
+        if op == "place" and t["kind"] != "spot":
+            return "a piece is there: click a free spot"
+        return None
 
     async def move(op):
         t = R.target
@@ -670,6 +706,10 @@ def robot_panel(E: Engine, R: Robot):
             R.target = {"kind": "piece", "color": color, "x": x, "y": y}
         else:
             R.target = {"kind": "spot", "x": float(flat[0]), "y": float(flat[1])}
+        t = R.target
+        both = sum(st is not None for _, st in (d["matched"] if d else []))
+        log(f"click -> {t['kind']} {t.get('color', '')} at table ({t['x']:.0f}, {t['y']:.0f}) mm; pieces both cameras "
+            f"see: {both}" + "".join(f"; {op}: {why_not(op) or 'ok'}" for op in ("hover", "pick", "place")))
     img.on_mouse(click)
 
     def target_text():
@@ -687,6 +727,11 @@ def robot_panel(E: Engine, R: Robot):
             others = [(np.hypot(st[0] - t["x"], st[1] - t["y"]), p.color) for p, st in E.det["matched"] if st is not None]
             if others and (m := min(others))[0] < SPACING_MM:
                 lines.append(f"⚠ the {m[1]} piece is {m[0]:.0f} mm away: the open fingers need {SPACING_MM:.0f}")
+        op = "pick" if t["kind"] == "piece" else "place"
+        if why := why_not(op):
+            lines.append(f"{op.capitalize()} is off: {why}")
+        if R.air:
+            lines.append(f"Air is on: a pick stops {AIR_MM:.0f} mm above the piece and grips nothing")
         return "\n".join(lines)
 
     def status_text():
@@ -757,11 +802,8 @@ def robot_panel(E: Engine, R: Robot):
             for b in (b_wake, b_home, b_show, b_open):
                 b.set_enabled(R.can_move)
             b_stop.set_enabled(R.link.connected)
-            t = R.target
-            ok = R.can_move and t is not None and R.reach(t["x"], t["y"]) is None
-            b_hover.set_enabled(ok)
-            b_pick.set_enabled(ok and t["kind"] == "piece")
-            b_place.set_enabled(ok and t["kind"] == "spot")
+            for b, op in ((b_hover, "hover"), (b_pick, "pick"), (b_place, "place")):
+                b.set_enabled(why_not(op) is None)
             hint.text = ("Click the board corner the fingertips touch" if fit_exp.value else
                          "Click a piece, or a free spot" if E.views is not None else "Calibrate first")
             fit.tick()
