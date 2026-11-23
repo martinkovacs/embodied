@@ -38,7 +38,16 @@ COLORS = {
 # blue all around. 0.9 keeps tight groups of same-coloured pieces.
 # match_mm: how far apart the two cameras may put the same piece on the table and still pair it (a calibration
 # that isn't perfect needs more; pieces are >= 40 mm apart, so not much over 20).
-DEFAULT_PARAMS = {"colors": COLORS, "min_fill": 0.55, "min_rim": 0.6, "max_around": 0.9, "match_mm": 20.0}
+# The outline (rim) is looked for in the picture's edges, not in the colour mask:
+# edge_pct: an edge counts as part of a rim if it is stronger than this percentile of all edges in the picture (90 =
+# the strongest 10 %). A busy background (carpet) raises the bar for every piece: lower finds softer outlines.
+# mask_edges: also count the edge of the colour mask as rim, so a piece the mask shows well needs no sharp outline.
+# rim_band: how far from the expected radius (share of it) an edge may lie and still count as the rim.
+# size: scales the piece radius the detector looks for (a top that looks bigger or smaller than 35 mm in the top view).
+# max_dz_mm: how far from the top-face height the two cameras' sighting may triangulate and still be a piece.
+DEFAULT_PARAMS = {"colors": COLORS, "min_fill": 0.55, "min_rim": 0.6, "max_around": 0.9, "match_mm": 20.0,
+                  "edge_pct": 90.0, "mask_edges": True, "rim_band": 0.12, "size": 1.0, "max_dz_mm": 0.8 * PIECE_H_MM}
+FLOAT_PARAMS = ("min_fill", "min_rim", "max_around", "match_mm", "edge_pct", "rim_band", "size", "max_dz_mm")
 DRAW = {"red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0)}
 
 
@@ -50,7 +59,9 @@ def load_params(path=None):
         for name, c in saved.get("colors", {}).items():
             if name in params["colors"]:
                 params["colors"][name] |= {k: tuple(v) if k == "h" else v for k, v in c.items() if k in ("h", "s", "v")}
-        params |= {k: float(saved[k]) for k in ("min_fill", "min_rim", "max_around", "match_mm") if k in saved}
+        params |= {k: float(saved[k]) for k in FLOAT_PARAMS if k in saved}
+        if "mask_edges" in saved:
+            params["mask_edges"] = bool(saved["mask_edges"])
     return params
 
 
@@ -238,8 +249,13 @@ def rim_votes(gx, gy, mag, edge_thr, r_px, min_rim):
 
 
 def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=None, smear=None, rejected=None,
-           max_around=0.9):
+           max_around=0.9, edge_pct=90.0, mask_edges=True, rim_band=0.12, probe=None):
     """Find top-face circles of radius r_px. Returns [(color, u, v, rim, fill)].
+
+    edge_pct, mask_edges, rim_band: what counts as the rim (DEFAULT_PARAMS).
+    probe: (u, v) instead of searching the whole image: the best circle near there, whatever its scores, as
+    (color, u, v, rim, fill, around, brightness, edge threshold), or None where there is no colour at all. For
+    telling why a piece isn't found.
 
     smear(u, v) -> (du, dv): where a piece's side shows in this image (TopView.smear). Without it, a candidate on
     the side of a piece seen at an angle can survive as a second detection of the same piece.
@@ -254,7 +270,7 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     best = (gxs ** 2 + gys ** 2).argmax(axis=2)[..., None]
     gx, gy = np.take_along_axis(gxs, best, 2)[..., 0], np.take_along_axis(gys, best, 2)[..., 0]
     mag = cv2.magnitude(gx, gy)
-    edge_thr = max(np.percentile(mag, 90), 20.0)
+    edge_thr = max(float(np.percentile(mag, edge_pct)), 20.0)
 
     masks = color_masks(bgr, colors)
     inner = _disk(0.8 * r_px).astype(np.float32)
@@ -297,12 +313,14 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     # candidates this close end up at the same top face after the grid search: refine one of them
     cell = max(r_px / 3, 1.0)
     cands = list({(round(x / cell), round(y / cell)): (x, y) for x, y in cands}.values())
+    if probe is not None:
+        cands = [tuple(map(float, probe))]
 
     # Score = rim * fill * brightness. Rim: on how many of 72 rays around the circle there is an edge
     # with a radial gradient. Each candidate is refined by a grid search within +-r, because Hough and
     # colour peaks often land on the piece's side instead of its top face.
     ang = np.linspace(0, 2 * np.pi, 72, endpoint=False)
-    radii = r_px + np.arange(-0.12, 0.121, 0.04) * r_px
+    radii = r_px + np.linspace(-rim_band, rim_band, 7) * r_px
     cos, sin = np.cos(ang), np.sin(ang)
     h, w = gray.shape
     names = list(fills)
@@ -311,8 +329,22 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     bright_flat = bright.ravel()
     # per pixel, flat for fast lookups: is it a rim edge (strong), and its gradient direction (0 where it isn't)
     strong = mag > edge_thr
-    ux = np.where(strong, gx / (mag + 1e-6), 0).astype(np.float32).ravel()
-    uy = np.where(strong, gy / (mag + 1e-6), 0).astype(np.float32).ravel()
+    ux = np.where(strong, gx / (mag + 1e-6), 0).astype(np.float32)
+    uy = np.where(strong, gy / (mag + 1e-6), 0).astype(np.float32)
+    if mask_edges:
+        # the colour masks' own edges count too (where the picture has no strong edge): smoothed a little more, so
+        # the specks a noisy mask has inside a top don't make edges of their own. A clean step in a mask blurred by
+        # s gives a Sobel peak of 8 / (sqrt(2 pi) s); half of that counts.
+        s2 = 2 * sigma
+        need = 0.5 * 8 / (np.sqrt(2 * np.pi) * s2)
+        for m in masks.values():
+            mb = cv2.GaussianBlur(m.astype(np.float32), (0, 0), s2)
+            mx, my = cv2.Sobel(mb, cv2.CV_32F, 1, 0), cv2.Sobel(mb, cv2.CV_32F, 0, 1)
+            mm = cv2.magnitude(mx, my)
+            add = (mm > need) & ~strong
+            ux[add], uy[add] = mx[add] / mm[add], my[add] / mm[add]
+            strong |= add
+    ux, uy = ux.ravel(), uy.ravel()
     ring_x, ring_y = radii[:, None] * cos, radii[:, None] * sin
 
     def score(xs, ys):
@@ -340,6 +372,8 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     results = []
     for x, y in cands:
         if best_fill[min(max(int(round(y)), 0), h - 1), min(max(int(round(x)), 0), w - 1)] < need_fill:
+            if probe is not None:
+                return None
             continue
         for ox, oy in (coarse, fine):  # coarse search within +-r, then fine within +-r/8
             xs, ys = x + ox, y + oy
@@ -349,6 +383,9 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
             k = int(s.argmax()) if s.max() > 0 else int(raw.argmax())   # nothing passes yet: follow the best try
             x, y = xs[k], ys[k]
         name = names[ci[k]]
+        if probe is not None:
+            return (name, float(x), float(y), float(rim[k]), float(fill[k]), around_at(name, x, y), float(br[k]),
+                    edge_thr)
         if s[k] <= 0 and (rejected is None or fill[k] < 0.4 or rim[k] < 0.3):
             continue        # neither a piece nor a near miss: no need for its surround
         around = around_at(name, x, y)
@@ -385,12 +422,10 @@ def detect_pieces(img, view: TopView | None = None, radius_px=None, params=None,
     """Detect pieces in a camera image. With a TopView, positions are also returned in table mm.
     params: load_params(); the defaults if None. rejected: a list to receive the near misses as Pieces (see
     detect). top: view.warp(img) if the caller already has it."""
-    p = params or DEFAULT_PARAMS
-    kw = dict(colors=p["colors"], min_rim=p["min_rim"], min_fill=p["min_fill"],
-              max_around=p.get("max_around", DEFAULT_PARAMS["max_around"]))
+    kw = detect_kwargs(params)
     misses = None if rejected is None else []
     if view is None:
-        found = detect(img, radius_px, rejected=misses, **kw)
+        found = detect(img, radius_px * size_of(params), rejected=misses, **kw)
         if rejected is not None:
             rejected += [Piece(c, (u, v), (u, v), None, rim, fill, around) for c, u, v, rim, fill, around in misses]
         return [Piece(c, (u, v), (u, v), None, rim, fill) for c, u, v, rim, fill in found]
@@ -400,10 +435,38 @@ def detect_pieces(img, view: TopView | None = None, radius_px=None, params=None,
         x, y = view.view_to_table(u, v)
         iu, iv = view.project([[x, y, view.z]])[0]
         return Piece(c, (u, v), (float(iu), float(iv)), (x, y, view.z), rim, fill, around)
-    found = detect(top, PIECE_D_MM / 2 * view.ppm, smear=view.smear, rejected=misses, **kw)
+    found = detect(top, PIECE_D_MM / 2 * view.ppm * size_of(params), smear=view.smear, rejected=misses, **kw)
     if rejected is not None:
         rejected += [piece(*m) for m in misses]
     return [piece(*f) for f in found]
+
+
+def detect_kwargs(params):
+    """detect()'s keyword arguments from load_params() (the defaults for anything missing)."""
+    p = DEFAULT_PARAMS | (params or {})
+    return dict(colors=p["colors"], min_rim=p["min_rim"], min_fill=p["min_fill"], max_around=p["max_around"],
+                edge_pct=p["edge_pct"], mask_edges=bool(p["mask_edges"]), rim_band=p["rim_band"])
+
+
+def size_of(params):
+    return float((params or {}).get("size", DEFAULT_PARAMS["size"]))
+
+
+def probe(top, view: TopView, u, v, params):
+    """Why is the piece at top-view pixel (u, v) found or not? The best circle near there with its scores and which
+    test each passes: {"color", "uv", "rim", "fill", "around", "edge_thr", "fails": [what keeps it out]}, or None
+    where there is no piece colour at all. Same tests as detect(), one place only."""
+    p = DEFAULT_PARAMS | (params or {})
+    r = detect(top, PIECE_D_MM / 2 * view.ppm * size_of(p), smear=view.smear, probe=(u, v), **detect_kwargs(p))
+    if r is None:
+        return None
+    color, x, y, rim, fill, around, _, edge_thr = r
+    fails = [f"{name} {val:.2f} {op} {lim:.2f}" for name, val, op, lim, ok in (
+        ("fill", fill, "<", p["min_fill"], fill >= p["min_fill"]),
+        ("rim", rim, "<", p["min_rim"], rim >= p["min_rim"]),
+        ("around", around, ">", p["max_around"], around <= p["max_around"])) if not ok]
+    return {"color": color, "uv": (x, y), "rim": rim, "fill": fill, "around": around, "edge_thr": edge_thr,
+            "fails": fails}
 
 
 def draw_misses(vis, misses, view: TopView):
