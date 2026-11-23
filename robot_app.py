@@ -545,6 +545,7 @@ def build_ui(E: Engine, R: Robot):
             chip_arm.text, color = arm_chip(R)
             chip_arm.props(f"color={color} text-color=white")
             E.want_detect = tab in (t_det.props["name"], t_3d.props["name"], t_rob.props["name"]) and det.live.value
+            E.want_corners = tab == t_cal.props["name"]
             if tab == t_cal.props["name"]:
                 cal.tick()
             elif tab == t_det.props["name"]:

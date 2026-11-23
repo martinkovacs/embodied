@@ -139,6 +139,8 @@ class Engine:
         self.params = pieces.load_params(self.params_file)
         self.params_id = 0                  # bumps whenever the thresholds change
         self.want_detect = False            # set by the UI: the detection or 3D tab is open and live detection on
+        self.want_corners = True            # set by the UI: the calibration tab is open (the live board search costs
+                                            # a lot of CPU on a slow PC, and only that tab shows it)
         self.det = None                     # the latest detection, see detect()
         self.det_error = None
         self._build_views()
@@ -224,7 +226,7 @@ class Engine:
                 time.sleep(0.5)
                 continue
             pattern = self.pattern
-            cl, cr = live_corners(fl, pattern), live_corners(fr, pattern)
+            cl, cr = (live_corners(fl, pattern), live_corners(fr, pattern)) if self.want_corners else (None, None)
             with self.lock:
                 if self.cams is not cams:     # reconnected meanwhile
                     continue
@@ -600,6 +602,7 @@ def build_ui(E: Engine):
                 chip_det.text, color = "detection off", "grey"
             chip_det.props(f"color={color} text-color=white")
             E.want_detect = tab in (t_det.props["name"], t_3d.props["name"]) and det.live.value
+            E.want_corners = tab == t_cal.props["name"]
             if tab == t_cal.props["name"]:
                 cal.tick()
             elif tab == t_det.props["name"]:

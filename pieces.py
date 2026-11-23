@@ -265,7 +265,17 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     o = (ring.shape[0] - hole.shape[0]) // 2
     ring[o:o + hole.shape[0], o:o + hole.shape[1]] -= hole
     ring /= ring.sum()
-    arounds = {c: cv2.filter2D(m.astype(np.float32), -1, ring, borderType=cv2.BORDER_CONSTANT) for c, m in masks.items()}
+    rr = ring.shape[0] // 2
+
+    def around_at(name, x, y):
+        """Share of the ring around (x, y) with the colour: the ring filter, at one pixel (zeros outside the image).
+        Only the surviving candidates need it, and over the whole image it is the slowest filter."""
+        m = masks[name]
+        hh, ww = m.shape
+        x, y = min(max(int(round(x)), 0), ww - 1), min(max(int(round(y)), 0), hh - 1)
+        y0, y1, x0, x1 = max(y - rr, 0), min(y + rr + 1, hh), max(x - rr, 0), min(x + rr + 1, ww)
+        k = ring[y0 - y + rr:y1 - y + rr, x0 - x + rr:x1 - x + rr]
+        return float((m[y0:y1, x0:x1] * k).sum())
     # Mean brightness of the disk: the top face is lit from above, the piece's side (smeared outwards
     # in the top view) is darker, so among overlapping candidates the brightest one is the top.
     bright = cv2.filter2D(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32) / 255, -1, inner,
@@ -297,24 +307,40 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     h, w = gray.shape
     names = list(fills)
     fill_stack = np.stack([fills[c] for c in names])
+    fill_flat = fill_stack.reshape(len(names), -1)
+    bright_flat = bright.ravel()
+    # per pixel, flat for fast lookups: is it a rim edge (strong), and its gradient direction (0 where it isn't)
+    strong = mag > edge_thr
+    ux = np.where(strong, gx / (mag + 1e-6), 0).astype(np.float32).ravel()
+    uy = np.where(strong, gy / (mag + 1e-6), 0).astype(np.float32).ravel()
+    ring_x, ring_y = radii[:, None] * cos, radii[:, None] * sin
 
     def score(xs, ys):
-        px = np.clip((xs[:, None, None] + radii[None, :, None] * cos).round().astype(int), 0, w - 1)
-        py = np.clip((ys[:, None, None] + radii[None, :, None] * sin).round().astype(int), 0, h - 1)
-        m = mag[py, px]
-        radial = np.abs(gx[py, px] * cos + gy[py, px] * sin) / (m + 1e-6)
-        rim = ((m > edge_thr) & (radial > 0.8)).any(axis=1).mean(axis=1)
-        xi, yi = np.clip(xs.round().astype(int), 0, w - 1), np.clip(ys.round().astype(int), 0, h - 1)
-        f = fill_stack[:, yi, xi]
-        return rim, f.argmax(0), f.max(0), bright[yi, xi]
+        px = np.clip(np.rint(xs[:, None, None] + ring_x), 0, w - 1).astype(np.intp)
+        py = np.clip(np.rint(ys[:, None, None] + ring_y), 0, h - 1).astype(np.intp)
+        i = py * w + px
+        radial = np.abs(ux[i] * cos + uy[i] * sin)
+        rim = (radial > 0.8).any(axis=1).mean(axis=1)
+        xi, yi = np.clip(np.rint(xs), 0, w - 1).astype(np.intp), np.clip(np.rint(ys), 0, h - 1).astype(np.intp)
+        j = yi * w + xi
+        f = fill_flat[:, j]
+        return rim, f.argmax(0), f.max(0), bright_flat[j]
 
     def grid(step, n):
         offs = np.arange(-n, n + 1) * step
         return [a.ravel() for a in np.meshgrid(offs, offs)]
 
     coarse, fine = grid(r_px / 8, 8), grid(r_px / 48, 6)
+    # The search below moves a candidate at most r + r/8: where no colour reaches a near miss's fill (0.4) or
+    # min_fill anywhere within that, it can't come to anything. One max filter finds those, and most candidates
+    # (edges of the table, the board, clutter) are skipped without the search.
+    reach = int(np.ceil(r_px + r_px / 8)) + 1
+    best_fill = cv2.dilate(fill_stack.max(0), np.ones((2 * reach + 1, 2 * reach + 1), np.uint8))
+    need_fill = min(min_fill, 0.4)
     results = []
     for x, y in cands:
+        if best_fill[min(max(int(round(y)), 0), h - 1), min(max(int(round(x)), 0), w - 1)] < need_fill:
+            continue
         for ox, oy in (coarse, fine):  # coarse search within +-r, then fine within +-r/8
             xs, ys = x + ox, y + oy
             rim, ci, fill, br = score(xs, ys)
@@ -323,8 +349,9 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
             k = int(s.argmax()) if s.max() > 0 else int(raw.argmax())   # nothing passes yet: follow the best try
             x, y = xs[k], ys[k]
         name = names[ci[k]]
-        h_, w_ = arounds[name].shape
-        around = float(arounds[name][min(max(int(round(y)), 0), h_ - 1), min(max(int(round(x)), 0), w_ - 1)])
+        if s[k] <= 0 and (rejected is None or fill[k] < 0.4 or rim[k] < 0.3):
+            continue        # neither a piece nor a near miss: no need for its surround
+        around = around_at(name, x, y)
         if s[k] > 0 and around <= max_around:
             results.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(br[k])))
         elif rejected is not None and fill[k] >= 0.4 and rim[k] >= 0.3:   # roughly piece-like only
