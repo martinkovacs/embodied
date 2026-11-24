@@ -1,26 +1,56 @@
-# First session on the lab PC
+# A session on the lab PC, step by step
 
 Do these in order. Stop at the first step that fails: it prints what to do.
 Keep one hand near the arm's **power switch** whenever it can move.
 
-## 1. Get the code (once)
+You need **two terminal windows**:
 
-Open a terminal:
+- **Terminal 1 (T1)** runs the arm side, the whole session. Nothing else goes in it.
+- **Terminal 2 (T2)** runs everything else, one program at a time: only one program can use the cameras.
+
+Everything here is for the lab PC's **Ubuntu 22.04**. Open a terminal with **Ctrl+Alt+T**, a second window with
+**Ctrl+Shift+N** in it. Paste into a terminal with **Ctrl+Shift+V** (Ctrl+V doesn't paste there). In both, first
+`cd ~/embodied`.
+
+## 0. Get the latest code (T2, every session)
 
 ```bash
-git clone https://github.com/martinkovacs/embodied.git
-cd embodied
+cd ~/embodied
+git pull --autostash
+```
+
+`--autostash` keeps this PC's own settings (`calib_data/settings.json`) across the pull. If the list of changed
+files it prints has anything under `ros_ws/`, also run `./lab.sh setup` once (a few minutes).
+If it stops with *divergent branches*, someone committed on the lab PC itself: don't force anything, ask
+before going on.
+
+**First time on a new PC only:**
+
+```bash
+git clone https://github.com/martinkovacs/embodied.git ~/embodied
+cd ~/embodied
 ./lab.sh setup
 ```
 
-It asks for the sudo password once, to install the arm's USB rule, and takes a few minutes. If it says packages are missing, run the command it prints (or ask the lab staff), then
-run `./lab.sh setup` again. It should end with `Setup finished.`
+It asks for the sudo password once, to install the arm's USB rule, and takes a few minutes. If it says packages are
+missing, run the command it prints (or ask the lab staff), then run `./lab.sh setup` again. It should end with
+`Setup finished.`
 
-## 2. Start the arm
+## 1. Place the cameras (no software)
 
-1. Plug in the arm and turn on its power.
+- **High:** 50 to 65 cm above the table, 35 to 45 cm (horizontally) from the middle of the work area, looking down
+  at it at 50 to 60 degrees. The work area is the ring 100 to 210 mm around the arm's base.
+- **Apart, not facing each other:** one from the front, the other from the side, 60 to 90 degrees apart around
+  the work area. Low cameras facing each other see mostly the pieces' sides, and then the two cameras disagree.
+- Each camera sees the whole work area, without the arm or the participant in front of it. A piece's top should be
+  at least 40 px wide in the camera picture.
+- Tighten them. **From now on the cameras must not move.** If one moves, redo from step 4.
+
+## 2. Start the arm (T1)
+
+1. Plug in the arm and turn on its power. Plug in both cameras too.
 2. Clear the table around the arm: no pieces, cables or hands within its reach.
-3. In the terminal:
+3. In **T1**:
 
 ```bash
 ./lab.sh arm
@@ -28,27 +58,23 @@ run `./lab.sh setup` again. It should end with `Setup finished.`
 
 Wait for `ARM SIDE READY`. The arm then **rises slowly to its home pose by itself**, from wherever it was lying:
 that is the sign that it works. If it stays down, the line above the warning says why.
+**Leave T1 running.**
 
-**Leave this terminal running.** Everything below goes in a **second terminal**
-(`cd embodied` first).
-
-Two rules for every start and stop of the arm side, today and later:
+Two rules for every start and stop of the arm side:
 
 - **Starting:** no pieces near the arm. It may sweep sideways while it gets up. Pieces go on the table after it is up.
 - **Stopping (Ctrl-C):** hold the arm first, or let it rest on the table. Its motors let go and it falls.
   Never just close the terminal: the motors then stay on, and the next start refuses with
   `Torque is enabled, cannot proceed` until the arm's power is switched off and on.
 
-## 3. Check that it moves
+## 3. Check that it moves (T2)
 
 ```bash
 ./lab.sh python lab_check.py
 ```
 
-Many lines say FAIL at this point, because nothing is calibrated yet. These four must be OK or WARN:
-*Arm USB adapter, ROS connection, Arm controllers, arm_node*.
-
-To move the arm without the cameras or the experiment, send it one command and read the answer:
+Before calibrating, many lines say FAIL. These four must be OK or WARN:
+*Arm USB adapter, ROS connection, Arm controllers, arm_node*. Then:
 
 ```bash
 ./lab.sh cmd '{"op": "open"}'
@@ -57,30 +83,42 @@ To move the arm without the cameras or the experiment, send it one command and r
 
 `"state": "done"` means it did it; `"failed"` comes with the reason.
 
-Plug in both cameras too, if they aren't already.
-
-## 4. Calibrate the cameras
+## 4. Calibrate the cameras (T2)
 
 ```bash
 ./lab.sh python calib_app.py
 ```
 
-Open <http://localhost:8080> (`calib_gui.py` is the old version of the same, kept for now).
+Open <http://localhost:8080>.
 
-1. **Setup tab:** press **Use the Basler cameras** (the ⇄ button swaps left and right). Set the board's real square
-   size and thickness. Press **Connect**.
-2. **Calibration tab:** lay the board flat on the table in front of the arm, seen by both cameras, and press
-   **Capture**. That one capture is the calibration. Optional, for a better lens model: also capture the board held
-   at other angles; from 6 views per camera the lens distortion is fitted too.
-3. **Write down which corner the coloured axes start from, and which way x and y point.** That corner is (0, 0):
-   the inner corner next to the board's dark corner square.
+1. **Setup tab:** press **Find cameras**, pick the two Basler cameras as *Left camera* and *Right camera* (the ⇄
+   button swaps them). Under *Checkerboard*:
+   - *Inner corners*: 9 and 6.
+   - *Square size*: **measure it**. Measure 5 squares in a row with a ruler and divide by 5. A few % off here makes
+     every distance a few % off.
+   - *Board thickness*: **measure it** (a printed board on cardboard can be 3 to 5 mm).
 
-**Don't move the cameras, the table or the arm from now on.** Leave the board where it is and close the window.
+   Press **Apply board settings**, then **Connect**.
+2. **Calibration tab:** press **Delete all**. Captures from earlier sessions are from other camera positions.
+3. **Lens views:** hold the board at different angles and in different places in front of the cameras, and press
+   **Capture** each time. One camera seeing it is enough. Go on until each camera has **at least 6 views**. The
+   result under the list then shows `RMS` per camera: it should be **about 1 px or less**. Delete a capture whose
+   error is over 1 px (its ✕), or one where the board was blurred.
+4. **The table capture:** lay the board **flat** on the table in front of the arm, with its short side that has
+   the **two dark corner squares against the arm's base**. Press **Capture**. This last capture sets the table (it
+   gets the ★).
+5. Look at the coloured axes: they start at (0, 0), the inner corner next to a dark corner square, and that must
+   be **next to the arm**. If they start at the far end, turn the board 180 degrees, delete that capture and
+   capture it again. **Write down which way x and y point.**
+6. **Detection tab:** press **Defaults** in *Thresholds*, then **Save**. That clears thresholds tuned for an
+   earlier setup.
 
-## 5. Show the arm where the table is
+**Leave the board exactly where it is.** Close calib_app with Ctrl-C in T2.
 
-1. Close the gripper, so the two fingertips meet.
-2. Hold the arm, then run:
+## 5. Show the arm where the table is (T2)
+
+1. Close the gripper, so the two fingertips meet: `./lab.sh cmd '{"op": "close"}'`.
+2. Hold the arm, then:
 
 ```bash
 ./lab.sh torque-off
@@ -88,38 +126,56 @@ Open <http://localhost:8080> (`calib_gui.py` is the old version of the same, kep
 ```
 
 3. Move the arm by hand until the fingertips touch a corner of the board squares. Type that corner's position in mm:
-   `x y`, counted from the (0, 0) corner of step 4. Squares are 25 mm, so for example `50 75`.
-4. Do this for 6 corners spread over the board. Press Enter on an empty line to finish. It should end with **OK**.
+   `x y`, counted from the (0, 0) corner of step 4, in squares times the square size (for 70 mm squares, for
+   example `70 140`).
+4. Do this for 6 corners spread over the part the arm reaches. Press Enter on an empty line to finish. It should
+   end with **OK**.
 5. Check with new corners. Every error must be **under 5 mm**, otherwise repeat this step:
 
 ```bash
 ./lab.sh python robot_frame.py --check
 ```
 
-6. Take the board away. Lay the arm down and **take your hands off it**. In the first terminal press Ctrl-C, wait
-   a few seconds and start `./lab.sh arm` again: the arm rises to its home pose by itself.
+6. **Take the board away**, carefully: the table must not move. Lay the arm down and **take your hands off it**.
+   In **T1** press Ctrl-C, wait a few seconds and start `./lab.sh arm` again: the arm rises to its home pose.
 
-## 6. Make the layout and place the pieces
+## 6. Check the detection (T2)
+
+The arm must be up before the pieces go on the table. Put pieces on the white table in the work area, then:
+
+```bash
+./lab.sh python calib_app.py
+```
+
+**Detection tab**, **Live detection** on. Every piece should be **coloured**: both cameras agree on it. Grey with `?`
+is a piece only one camera finds; the runner ignores those.
+
+- A piece is missing: switch **Near misses** on. The grey circle with scores shows which limit keeps it out. First
+  try *rim* 0.5 instead of 0.6. A colour isn't found: click the middle of that piece's top (*Click to tune*).
+  Press **Save** after any change.
+- Then press the **bug button**, **Save snapshot**, and send the zip from `calib_data/debug/`: with it the
+  thresholds can be checked away from the lab.
+
+Close calib_app with Ctrl-C.
+
+## 7. Make the layout and place the pieces (T2)
 
 ```bash
 ./lab.sh python lab_layout.py --conditions smoke correct
 ./lab.sh python lab_layout.py --view --condition smoke
 ```
 
-The arm must be up before the pieces go on the table. Put one piece on each of the 3 thick circles (r1, g1, b1). The circle gets thicker when the camera sees the
-right colour there. Press **q** when all 3 are thick.
+Put one piece on each of the 3 thick circles (r1, g1, b1). The circle gets thicker when the camera sees the right
+colour there. Press **q** when all 3 are thick. If some circles are off the table, add
+`--bounds XMIN XMAX YMIN YMAX` (table mm) to the first command.
 
-If some circles are off the table, add `--bounds XMIN XMAX YMIN YMAX` (table mm) to the first command.
-
-## 7. Check again
+## 8. Check again, then the hover test (T2)
 
 ```bash
 ./lab.sh python lab_check.py
 ```
 
-Fix anything that says FAIL. *Spoken answers* can stay a warning today.
-
-## 8. Hover test
+Fix anything that says FAIL. *Spoken answers* can stay a warning.
 
 ```bash
 ./lab.sh python lab_check.py --hover
@@ -128,7 +184,7 @@ Fix anything that says FAIL. *Spoken answers* can stay a warning today.
 The arm stops above each piece. Answer whether the fingertips are really above it. If it goes somewhere completely
 different, the (0, 0) corner in step 5 was the wrong one: redo step 5.
 
-**One piece at a time, by hand:** close `calib_app.py` (only one program can use the cameras), then
+**One piece at a time, by hand** (optional):
 
 ```bash
 ./lab.sh python robot_app.py
@@ -144,19 +200,19 @@ terminal and to `logs/robot_app.log`.
 turns one joint by 0.1 rad, slowly: `1`/`q` joint 1 (base, left/right), `2`/`w` joint 2, `3`/`e` joint 3,
 `4`/`r` joint 4 (wrist). `o` opens the gripper, `p` closes it, `h` goes home, **Esc** stops. A step past a joint's
 limit, into the table or into the arm itself is refused, with the reason on screen and in the log. **Close
-gripper** is also a button. After `./lab.sh arm` was restarted with this version, the arm side knows the new
-commands; an older arm side answers `unknown op 'jog'`.
+gripper** is also a button. An arm side started before this version answers `unknown op 'jog'`: restart T1.
 
-## 9. Dry run
+## 9. Dry run (T2)
 
 ```bash
 ./lab.sh python runner.py --participant TEST --vision cameras --no-speech --air
 ```
 
 Open <http://localhost:8081> and press **Start**. The arm does everything slowly and high up, without touching a
-piece. `--no-speech` means no microphone: if the robot asks something, click the answer on the panel. The red **STOP** button halts it. Close it with Ctrl-C when it says done.
+piece. `--no-speech` means no microphone: if the robot asks something, click the answer on the panel. The red
+**STOP** button halts it. Close it with Ctrl-C when it says done.
 
-## 10. The real thing
+## 10. The real thing (T2)
 
 The same command without `--air`:
 
@@ -168,8 +224,8 @@ Three pieces sorted into their zones means **the robot works**.
 
 ## Every later session
 
-Once steps 1 to 10 have worked, a session is one command in one terminal. Stop `./lab.sh arm` first if it is
-still running.
+Once steps 1 to 10 have worked, a session is step 0 (`git pull --autostash`) and then one command in one terminal.
+Stop `./lab.sh arm` first if it is still running. If a camera or the table moved since, redo from step 4 first.
 
 1. Table clear of pieces, arm powered on.
 2. Start it. The arm rises by itself; if it doesn't, the reason is printed.
@@ -216,13 +272,13 @@ The first one that is missing shows where the start broke:
 | `home` refuses, "cannot be lifted by a command" | Take the pieces near the arm away, then `./lab.sh cmd '{"op": "wake"}'` |
 | The arm doesn't rise after `ARM SIDE READY` | Read the reason printed there. "controller not running": power and USB of the arm, then restart `./lab.sh arm` |
 | The arm doesn't go to a piece, or Pick is greyed out (`robot_app.py`) | Read "Pick is off: …" under *Target*, or the last lines of `logs/robot_app.log`. `out of reach … mm from the base axis`: keep pieces about 100 to 210 mm from the arm's base. `not within 25 mm of a piece BOTH cameras see`: only pieces both cameras find can be picked; Live detection on, better light or thresholds. The arm side's own answer (`cmd:` and `"failed"` lines) is in the `./lab.sh arm` terminal |
-| A camera won't open | Close `calib_gui.py`. Only one program can use a camera at a time |
+| A camera won't open | Close `calib_app.py` / `robot_app.py`. Only one program can use a camera at a time |
 | "Cameras found: none" for the Basler cameras (USB) | `echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="2676", MODE="0666"' \| sudo tee /etc/udev/rules.d/69-basler.rules`, then `sudo udevadm control --reload-rules`, and replug them |
 | Basler cameras not found (network models) | They need an IP on the PC's network: ask the lab staff, or set it in Basler's pylon Viewer |
 | Basler image too dark or colours shifting | Exposure and white balance are automatic: add light, and don't change it during a session |
 | Only one camera available | `calib_gui.py --one-camera` tries out the GUI, but can't be used for the real run |
 | "Camera gave no image" | Plug the two cameras into different USB ports |
-| A colour isn't detected, or a piece is seen twice | Check the lighting, then tune the thresholds under *Sensitivity* in calib_gui.py's detection tab (the colour mask shows what passes) and press Save |
+| A colour isn't detected, or a piece is seen twice | Check the lighting, then tune the thresholds under *Thresholds* in calib_app.py's Detection tab (the colour mask shows what passes) and press Save |
 | "Closed on nothing" with a piece in the gripper | Lower `EMPTY_MARGIN` in `arm_node.py`, and restart `./lab.sh arm` |
 | An empty gripper isn't noticed by the arm | Expected for now: the cameras catch the miss. Not yet tuned on the real arm |
 | The fingers hit the table or miss the piece | Press STOP, then adjust `GRASP_Z` in `kinematics.py` and restart `./lab.sh arm` |
