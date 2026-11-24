@@ -248,6 +248,64 @@ def rim_votes(gx, gy, mag, edge_thr, r_px, min_rim):
     return [tuple(c) for c in centroids[1:]]
 
 
+def edge_map(bgr, r_px, colors=COLORS, edge_pct=90.0, mask_edges=True):
+    """What detect() counts as edges, for the rim test (and for draw_edges). Returns a dict: sigma, gray (blurred),
+    gx, gy, mag (colour gradient), thr (the edge threshold), masks (colour masks), picture (bool: strong edges in
+    the picture), from_mask (bool: edges only the colour masks have, with mask_edges), ux, uy (flat: unit gradient
+    direction where there is an edge, 0 elsewhere), shape."""
+    sigma = max(r_px / 25, 1.0)
+    gray = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (0, 0), sigma)
+    # Colour gradient: per pixel, the BGR channel with the strongest gradient. Grey alone misses
+    # e.g. red/green boundaries, which have about the same brightness.
+    blur = cv2.GaussianBlur(bgr, (0, 0), sigma).astype(np.float32)
+    gxs, gys = cv2.Sobel(blur, cv2.CV_32F, 1, 0), cv2.Sobel(blur, cv2.CV_32F, 0, 1)
+    best = (gxs ** 2 + gys ** 2).argmax(axis=2)[..., None]
+    gx, gy = np.take_along_axis(gxs, best, 2)[..., 0], np.take_along_axis(gys, best, 2)[..., 0]
+    mag = cv2.magnitude(gx, gy)
+    edge_thr = max(float(np.percentile(mag, edge_pct)), 20.0)
+    masks = color_masks(bgr, colors)
+    # per pixel: is it a rim edge (strong), and its gradient direction (0 where it isn't)
+    picture = mag > edge_thr
+    strong = picture.copy()
+    ux = np.where(strong, gx / (mag + 1e-6), 0).astype(np.float32)
+    uy = np.where(strong, gy / (mag + 1e-6), 0).astype(np.float32)
+    if mask_edges:
+        # the colour masks' own edges count too (where the picture has no strong edge): smoothed a little more, so
+        # the specks a noisy mask has inside a top don't make edges of their own. A clean step in a mask blurred by
+        # s gives a Sobel peak of 8 / (sqrt(2 pi) s); half of that counts.
+        s2 = 2 * sigma
+        need = 0.5 * 8 / (np.sqrt(2 * np.pi) * s2)
+        for m in masks.values():
+            mb = cv2.GaussianBlur(m.astype(np.float32), (0, 0), s2)
+            mx, my = cv2.Sobel(mb, cv2.CV_32F, 1, 0), cv2.Sobel(mb, cv2.CV_32F, 0, 1)
+            mm = cv2.magnitude(mx, my)
+            add = (mm > need) & ~strong
+            ux[add], uy[add] = mx[add] / mm[add], my[add] / mm[add]
+            strong |= add
+    return {"sigma": sigma, "gray": gray, "gx": gx, "gy": gy, "mag": mag, "thr": edge_thr, "masks": masks,
+            "picture": picture, "from_mask": strong & ~picture, "ux": ux.ravel(), "uy": uy.ravel(),
+            "shape": gray.shape}
+
+
+RIM_RAYS = 72
+
+
+def rim_hits(edges, xs, ys, r_px, rim_band):
+    """The rim test at circle centres (xs, ys): (len(xs), RIM_RAYS) bools, True where that ray around the circle
+    meets an edge (edge_map) pointing along the ray, within rim_band of the radius. A circle's rim score is the
+    share of True."""
+    ang = np.linspace(0, 2 * np.pi, RIM_RAYS, endpoint=False)
+    radii = r_px + np.linspace(-rim_band, rim_band, 7) * r_px
+    cos, sin = np.cos(ang), np.sin(ang)
+    h, w = edges["shape"]
+    xs, ys = np.atleast_1d(np.asarray(xs, float)), np.atleast_1d(np.asarray(ys, float))
+    px = np.clip(np.rint(xs[:, None, None] + radii[:, None] * cos), 0, w - 1).astype(np.intp)
+    py = np.clip(np.rint(ys[:, None, None] + radii[:, None] * sin), 0, h - 1).astype(np.intp)
+    i = py * w + px
+    radial = np.abs(edges["ux"][i] * cos + edges["uy"][i] * sin)
+    return (radial > 0.8).any(axis=1)
+
+
 def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=None, smear=None, rejected=None,
            max_around=0.9, edge_pct=90.0, mask_edges=True, rim_band=0.12, probe=None):
     """Find top-face circles of radius r_px. Returns [(color, u, v, rim, fill)].
@@ -261,18 +319,8 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     the side of a piece seen at an angle can survive as a second detection of the same piece.
     rejected: a list to receive the near misses, (color, u, v, rim, fill) of circles that failed min_rim or
     min_fill, for tuning: they show which threshold keeps a piece out."""
-    sigma = max(r_px / 25, 1.0)
-    gray = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (0, 0), sigma)
-    # Colour gradient: per pixel, the BGR channel with the strongest gradient. Grey alone misses
-    # e.g. red/green boundaries, which have about the same brightness.
-    blur = cv2.GaussianBlur(bgr, (0, 0), sigma).astype(np.float32)
-    gxs, gys = cv2.Sobel(blur, cv2.CV_32F, 1, 0), cv2.Sobel(blur, cv2.CV_32F, 0, 1)
-    best = (gxs ** 2 + gys ** 2).argmax(axis=2)[..., None]
-    gx, gy = np.take_along_axis(gxs, best, 2)[..., 0], np.take_along_axis(gys, best, 2)[..., 0]
-    mag = cv2.magnitude(gx, gy)
-    edge_thr = max(float(np.percentile(mag, edge_pct)), 20.0)
-
-    masks = color_masks(bgr, colors)
+    e = edge_map(bgr, r_px, colors, edge_pct, mask_edges)
+    gray, gx, gy, mag, edge_thr, masks = e["gray"], e["gx"], e["gy"], e["mag"], e["thr"], e["masks"]
     inner = _disk(0.8 * r_px).astype(np.float32)
     inner /= inner.sum()
     fills = {c: cv2.filter2D(m.astype(np.float32), -1, inner, borderType=cv2.BORDER_CONSTANT) for c, m in masks.items()}
@@ -319,40 +367,14 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     # Score = rim * fill * brightness. Rim: on how many of 72 rays around the circle there is an edge
     # with a radial gradient. Each candidate is refined by a grid search within +-r, because Hough and
     # colour peaks often land on the piece's side instead of its top face.
-    ang = np.linspace(0, 2 * np.pi, 72, endpoint=False)
-    radii = r_px + np.linspace(-rim_band, rim_band, 7) * r_px
-    cos, sin = np.cos(ang), np.sin(ang)
     h, w = gray.shape
     names = list(fills)
     fill_stack = np.stack([fills[c] for c in names])
     fill_flat = fill_stack.reshape(len(names), -1)
     bright_flat = bright.ravel()
-    # per pixel, flat for fast lookups: is it a rim edge (strong), and its gradient direction (0 where it isn't)
-    strong = mag > edge_thr
-    ux = np.where(strong, gx / (mag + 1e-6), 0).astype(np.float32)
-    uy = np.where(strong, gy / (mag + 1e-6), 0).astype(np.float32)
-    if mask_edges:
-        # the colour masks' own edges count too (where the picture has no strong edge): smoothed a little more, so
-        # the specks a noisy mask has inside a top don't make edges of their own. A clean step in a mask blurred by
-        # s gives a Sobel peak of 8 / (sqrt(2 pi) s); half of that counts.
-        s2 = 2 * sigma
-        need = 0.5 * 8 / (np.sqrt(2 * np.pi) * s2)
-        for m in masks.values():
-            mb = cv2.GaussianBlur(m.astype(np.float32), (0, 0), s2)
-            mx, my = cv2.Sobel(mb, cv2.CV_32F, 1, 0), cv2.Sobel(mb, cv2.CV_32F, 0, 1)
-            mm = cv2.magnitude(mx, my)
-            add = (mm > need) & ~strong
-            ux[add], uy[add] = mx[add] / mm[add], my[add] / mm[add]
-            strong |= add
-    ux, uy = ux.ravel(), uy.ravel()
-    ring_x, ring_y = radii[:, None] * cos, radii[:, None] * sin
 
     def score(xs, ys):
-        px = np.clip(np.rint(xs[:, None, None] + ring_x), 0, w - 1).astype(np.intp)
-        py = np.clip(np.rint(ys[:, None, None] + ring_y), 0, h - 1).astype(np.intp)
-        i = py * w + px
-        radial = np.abs(ux[i] * cos + uy[i] * sin)
-        rim = (radial > 0.8).any(axis=1).mean(axis=1)
+        rim = rim_hits(e, xs, ys, r_px, rim_band).mean(axis=1)
         xi, yi = np.clip(np.rint(xs), 0, w - 1).astype(np.intp), np.clip(np.rint(ys), 0, h - 1).astype(np.intp)
         j = yi * w + xi
         f = fill_flat[:, j]
@@ -497,6 +519,41 @@ def draw_top(top, found, misses, ppm, lone=()):
         alone = any(p is q for q in lone)
         c = tuple(int(round(v)) for v in p.view_uv)
         cv2.circle(vis, c, r, (150, 150, 150) if alone else DRAW[p.color], 2, cv2.LINE_AA)
+    return vis
+
+
+def draw_edges(top, view: TopView, params, found, misses, lone=()):
+    """The edges the detector sees, on the top view: white = an edge in the picture, yellow = an edge only the colour
+    mask has ("Outline from the mask too"). For every piece found (colour; grey = one camera only) and near miss
+    (thin grey): its rim test, a dot per ray, green where it met an edge, red where not, and a line from its centre
+    to where its side shows (towards the camera). Shows why a piece misses min_rim, and, for a piece found twice,
+    which of the two sits on its side."""
+    p = DEFAULT_PARAMS | (params or {})
+    r_px = PIECE_D_MM / 2 * view.ppm * size_of(p)
+    e = edge_map(top, r_px, p["colors"], p["edge_pct"], bool(p["mask_edges"]))
+    vis = (cv2.cvtColor(e["gray"], cv2.COLOR_GRAY2BGR) * 0.35).astype(np.uint8)
+    vis[e["picture"]] = (255, 255, 255)
+    vis[e["from_mask"]] = (0, 220, 255)
+    ang = np.linspace(0, 2 * np.pi, RIM_RAYS, endpoint=False)
+    for q in list(misses) + list(found):
+        miss = not any(q is f for f in found)
+        x, y = q.view_uv
+        hits = rim_hits(e, [x], [y], r_px, p["rim_band"])[0]
+        col = (150, 150, 150) if miss or any(q is f for f in lone) else DRAW[q.color]
+        c = (int(round(x)), int(round(y)))
+        cv2.circle(vis, c, int(round(r_px)), col, 1, cv2.LINE_AA)
+        for a, hit in zip(ang, hits):
+            pt = (int(round(x + r_px * np.cos(a))), int(round(y + r_px * np.sin(a))))
+            cv2.circle(vis, pt, 2, (0, 200, 0) if hit else (0, 0, 230), -1)
+        du, dv = view.smear(x, y)
+        cv2.line(vis, c, (int(round(x + du)), int(round(y + dv))), col, 1, cv2.LINE_AA)
+        cv2.drawMarker(vis, c, col, cv2.MARKER_CROSS, 8, 1)
+        label = f"{q.color}{'?' if miss else ''} rim {hits.mean():.2f} fill {q.fill:.2f}"
+        at = (c[0] - int(r_px), c[1] - int(r_px) - 6 if miss else c[1] + int(r_px) + 14)   # misses above, pieces below
+        cv2.putText(vis, label, at, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, label, at, cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+    cv2.putText(vis, f"edge threshold {e['thr']:.0f} (strongest {100 - p['edge_pct']:.0f} %)", (10, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
     return vis
 
 
