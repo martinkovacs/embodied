@@ -576,7 +576,15 @@ def seen_by(view, xyz):
 def detect(frames, views, calib, params):
     """Both cameras' pieces, paired: {"matched": [(left Piece, table xyz or None)], and per camera (left, right):
     "found", "misses" (near misses), "tops" (top views), "lone" (pieces only that camera sees), "raw" (found, before
-    dropping the ones outside the other camera's view)}."""
+    dropping the ones outside the other camera's view)}.
+    params["method"] "fused": pieces.detect_fused, both cameras at once: every piece comes out paired, none lone."""
+    if params.get("method", "fused") == "fused":
+        misses = ([], [])
+        tops = tuple(v.warp(f) for v, f in zip(views, frames))
+        pl, pr = pieces.detect_fused(frames, views, params, rejected=misses, tops=tops)
+        return {"matched": [(p, np.array(p.table_mm, float)) for p in pl], "found": (pl, pr), "misses": misses,
+                "tops": tops, "lone": ([], []), "notes": {}, "raw": (pl, pr)}
+
     def one(i):
         top, misses = views[i].warp(frames[i]), []
         return pieces.detect_pieces(frames[i], views[i], params=params, rejected=misses, top=top), misses, top
@@ -1118,6 +1126,14 @@ def threshold_sliders(E):
     """Sliders bound to E.params through E.set_param. load() puts the current values back (after a click-to-tune)."""
     widgets = {}
     with ui.column().classes("w-full gap-1"):
+        ui.label("method").classes("text-sm font-medium")
+        widgets["method"] = ui.toggle({"fused": "Both cameras", "classic": "Per camera"}, value=E.params["method"]) \
+            .props("dense")
+        ui.label("Both cameras: the two colour masks combined on the plane of the tops (brightness-weighted, in "
+                 "greyscale), circles found in each colour's combined image; every piece is seen by both, so none is "
+                 "unpaired. Colours, fill, rim, around and size apply; edges, band, outline-from-mask, match and "
+                 "height are Per camera only. Per camera: the earlier detector, each camera alone, then paired.") \
+            .classes("text-xs opacity-60")
         for name, c in E.params["colors"].items():
             ui.label(name).classes("text-sm font-medium mt-1").style(f"color: {HEX[name]}")
             lo, hi = (-60, 60) if name == "red" else (0, 180)
@@ -1177,6 +1193,8 @@ def threshold_sliders(E):
                 p["colors"][name][k] = (int(value["min"]), int(value["max"])) if k == "h" else int(value)
             elif key == "mask_edges":
                 p[key] = bool(value)
+            elif key == "method":
+                p[key] = value
             else:
                 p[key] = float(value)
         E.set_param(put)
