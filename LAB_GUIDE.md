@@ -40,8 +40,10 @@ missing, run the command it prints (or ask the lab staff), then run `./lab.sh se
 
 - **High:** 50 to 65 cm above the table, 35 to 45 cm (horizontally) from the middle of the work area, looking down
   at it at 50 to 60 degrees. The work area is the ring 100 to 210 mm around the arm's base.
-- **Apart, not facing each other:** one from the front, the other from the side, 60 to 90 degrees apart around
-  the work area. Low cameras facing each other see mostly the pieces' sides, and then the two cameras disagree.
+- **Both on the same side of the table, 60 to 90 degrees apart** around the work area (one from the front, the
+  other from the side), on the side away from the participant. Not facing each other: low cameras facing each
+  other see mostly the pieces' sides, and then the two cameras disagree. On one side, both cameras can see the
+  board you hold up in step 4 at the same time, which calibrates them against each other.
 - Each camera sees the whole work area, without the arm or the participant in front of it. A piece's top should be
   at least 40 px wide in the camera picture.
 - Tighten them. **From now on the cameras must not move.** If one moves, redo from step 4.
@@ -100,13 +102,16 @@ Open <http://localhost:8080>.
 
    Press **Apply board settings**, then **Connect**.
 2. **Calibration tab:** press **Delete all**. Captures from earlier sessions are from other camera positions.
-3. **Lens views:** hold the board at different angles and in different places in front of the cameras, and press
-   **Capture** each time. One camera seeing it is enough. Go on until each camera has **at least 6 views**. The
-   result under the list then shows `RMS` per camera: it should be **about 1 px or less**. Delete a capture whose
-   error is over 1 px (its ✕), or one where the board was blurred.
+3. **Lens views:** hold the board still at different angles (20 to 45° tilted, different ways) and in different
+   places in front of the cameras, and press **Capture view** each time. One camera seeing it is enough, but hold
+   it so **both** see it as often as you can: those views also fix where one camera is from the other. Go on until
+   the counter next to the button says **6/6 ✓ for both cameras** (8 to 12 is better). The result under the list
+   then shows `RMS` per camera: it should be **about 1 px or less**. Delete a capture shown in red (over 1 px, its
+   ✕), or one where the board was blurred. Fewer than 6 views: the header says *rough* and positions can be
+   centimetres off.
 4. **The table capture:** lay the board **flat** on the table in front of the arm, with its short side that has
-   the **two dark corner squares against the arm's base**. Press **Capture**. This last capture sets the table (it
-   gets the ★).
+   the **two dark corner squares against the arm's base**. Press **Capture table**. It gets the ★ and sets the
+   table.
 5. Look at the coloured axes: they start at (0, 0), the inner corner next to a dark corner square, and that must
    be **next to the arm**. If they start at the far end, turn the board 180 degrees, delete that capture and
    capture it again. **Write down which way x and y point.**

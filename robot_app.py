@@ -577,9 +577,8 @@ def build_ui(E: Engine, R: Robot):
             else:
                 chip_cam.text, color = "no cameras", "grey"
             chip_cam.props(f"color={color} text-color=white")
-            ok = E.calib is not None and E.calib.T_left_table is not None
-            chip_cal.text = "loading captures…" if E.loading else "calibrated" if ok else "not calibrated"
-            chip_cal.props(f"color={'positive' if ok else 'grey'} text-color=white")
+            chip_cal.text, color = E.calib_status()
+            chip_cal.props(f"color={color} text-color=white")
             d = E.det
             if E.det_error:
                 chip_det.text, color = E.det_error[:50], "negative"

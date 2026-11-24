@@ -123,6 +123,10 @@ def check_calibration():
     c = StereoCalib.load(cameras.CALIB_PATH)
     if c.T_left_table is None:
         raise Fail("no table pose: capture it in calib_gui.py")
+    flat = [side for side in ("left", "right") if not any(getattr(c, side).dist)]
+    if flat:
+        raise Fail(f"{' and '.join(flat)} lens without distortion: capture 6+ lens views per camera in calib_app.py "
+                   "(Capture view), then Capture table")
     if c.rms >= 1.0:
         raise Fail(f"RMS {c.rms:.2f} px is too high: delete the worst pairs in calib_gui.py and recalibrate")
     if c.rms >= 0.5:

@@ -313,13 +313,20 @@ def calibrate_lens(corners: list[np.ndarray], image_size, pattern=PATTERN,
 
 
 def stereo_from_table(corners_left, corners_right, left: CameraCalib, right: CameraCalib, pattern=PATTERN,
-                      square_mm=25.0, same_camera=False) -> tuple[StereoCalib, dict]:
-    """The whole session calibration from one view of a board lying flat on the table, seen by both cameras
-    (corners in canonical order, see canonical_corners). Each camera's pose against the board comes from its own
-    view; the stereo geometry follows from the two poses, so no stereo pairs are needed while the cameras stay put.
+                      square_mm=25.0, same_camera=False, pairs=()) -> tuple[StereoCalib, dict]:
+    """The session calibration from a board lying flat on the table, seen by both cameras (corners in canonical
+    order, see canonical_corners), plus any other views of the board both cameras saw at the same time (`pairs`,
+    a list of (left corners, right corners)).
+
+    The table frame comes from the left camera's pose against the flat board. The stereo geometry (where the right
+    camera is from the left one) comes from all the views both cameras saw, the flat board included, fitted together
+    (calibrate_stereo, lenses fixed); without other views, from the two cameras' poses against the flat board alone,
+    which a lens error or a slightly bent board throws off.
 
     Table frame as in table_pose_from_pair. Returns (StereoCalib, check): check has each camera's reprojection
-    error (px) and how far the board's corners triangulate from where they are (mm, mean and max)."""
+    error on the flat board (px; the right one through the stereo geometry, so it shows how well the two agree), how
+    far the board's corners triangulate from where they are (mm, mean and max), and with `pairs` the stereo
+    error of each view (pair_px: the flat board first, then `pairs` in order) and how many views that was."""
     flip = np.diag([1.0, -1.0, -1.0, 1.0])
     T_l = _pose(corners_left, left, pattern, square_mm)
     flipped = float(T_l[:3, 2] @ (-T_l[:3, 3])) < 0     # board z must point towards the camera: z up
@@ -330,14 +337,24 @@ def stereo_from_table(corners_left, corners_right, left: CameraCalib, right: Cam
         px = cv2.projectPoints(obj.reshape(-1, 1, 3), cv2.Rodrigues(T[:3, :3])[0], T[:3, 3], cam.K, cam.dist)[0]
         return (T @ flip if flipped else T), _rms_px(px, corners)
     T_l, err_l = pose(corners_left, left)
+    check = {"left_px": err_l, "right_px": None, "mean_mm": None, "max_mm": None, "pair_px": None, "stereo_views": 1}
     if same_camera:      # one camera for both views: no disparity; 1 mm stands in so rectification doesn't divide by 0
         R, t, err_r = np.eye(3), np.array([-1.0, 0.0, 0.0]), err_l
+    elif pairs:
+        st, per_pair = calibrate_stereo([corners_left] + [p[0] for p in pairs], [corners_right] + [p[1] for p in pairs],
+                                        left, right, pattern, square_mm)
+        R, t = st.R, st.T
+        T_board = T_l @ flip if flipped else T_l                    # the board's actual pose in the left camera
+        X = (T_board[:3, :3] @ obj.T).T + T_board[:3, 3]
+        px = cv2.projectPoints((X @ R.T + t).reshape(-1, 1, 3), np.zeros(3), np.zeros(3), right.K, right.dist)[0]
+        err_r = _rms_px(px, corners_right)
+        check |= {"pair_px": per_pair, "stereo_views": len(per_pair)}
     else:
         T_r, err_r = pose(corners_right, right)
         R = T_r[:3, :3] @ T_l[:3, :3].T
         t = T_r[:3, 3] - R @ T_l[:3, 3]
+    check["right_px"] = err_r
     calib = StereoCalib(left, right, R, t, max(err_l, err_r), T_l, pattern, square_mm)
-    check = {"left_px": err_l, "right_px": err_r, "mean_mm": None, "max_mm": None}
     if not same_camera:
         X = calib.to_table(calib.triangulate(corners_left, corners_right))
         truth = obj * ([1, -1, -1] if flipped else 1)
