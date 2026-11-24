@@ -207,6 +207,9 @@ class Vision:
             if (left.shape[1], left.shape[0]) != tuple(self.calib.left.image_size):
                 raise Unplanned(f"camera gives {left.shape[1]}x{left.shape[0]}, calibrated at "
                                 f"{self.calib.left.image_size[0]}x{self.calib.left.image_size[1]}")
+            if self.params.get("method", "fused") == "fused":   # both cameras at once: every piece is a pair
+                pl, _ = pieces.detect_fused((left, right), self.views, self.params)
+                return [(p.color, float(p.table_mm[0]), float(p.table_mm[1])) for p in pl], (left, right)
             with ThreadPoolExecutor(2) as pool:     # OpenCV releases the GIL: both cameras at once
                 pl, pr = pool.map(lambda iv: pieces.detect_pieces(iv[0], iv[1], params=self.params),
                                   ((left, self.views[0]), (right, self.views[1])))

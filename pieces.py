@@ -1,8 +1,8 @@
 """Detect cylindrical pieces (red / blue / green, 35 mm diameter, 30 mm tall) by colour + known size.
 
 Calibrated mode (--calib): the camera image is remapped to a top-down view of the plane at piece-top
-height, where every top face is an exact circle of known pixel radius. Candidates (fixed-radius Hough +
-colour-disk peaks) are scored by rim edges and colour fill. Positions come out in table mm.
+height, where every top face is an exact circle of known pixel radius. Candidates (fixed-radius Hough on each
+colour's mask + colour-disk peaks + rim edge votes) are scored by rim edges and colour fill. Positions come out in table mm.
 
 Uncalibrated mode (--radius-px): same detector run directly on the image. Only sensible for a camera
 looking roughly straight down; with an oblique view the tops are ellipses and detection degrades.
@@ -45,8 +45,12 @@ COLORS = {
 # rim_band: how far from the expected radius (share of it) an edge may lie and still count as the rim.
 # size: scales the piece radius the detector looks for (a top that looks bigger or smaller than 35 mm in the top view).
 # max_dz_mm: how far from the top-face height the two cameras' sighting may triangulate and still be a piece.
+# method: "fused" (detect_fused: both cameras' colour masks combined on the top-face plane, Hough circle centres on
+# each colour) or "classic" (detect_pieces per camera, then matched_pieces).
 DEFAULT_PARAMS = {"colors": COLORS, "min_fill": 0.55, "min_rim": 0.6, "max_around": 0.9, "match_mm": 20.0,
-                  "edge_pct": 90.0, "mask_edges": True, "rim_band": 0.12, "size": 1.0, "max_dz_mm": 0.8 * PIECE_H_MM}
+                  "edge_pct": 90.0, "mask_edges": True, "rim_band": 0.12, "size": 1.0, "max_dz_mm": 0.8 * PIECE_H_MM,
+                  "method": "fused"}
+METHODS = ("fused", "classic")
 FLOAT_PARAMS = ("min_fill", "min_rim", "max_around", "match_mm", "edge_pct", "rim_band", "size", "max_dz_mm")
 DRAW = {"red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0)}
 
@@ -62,6 +66,8 @@ def load_params(path=None):
         params |= {k: float(saved[k]) for k in FLOAT_PARAMS if k in saved}
         if "mask_edges" in saved:
             params["mask_edges"] = bool(saved["mask_edges"])
+        if saved.get("method") in METHODS:
+            params["method"] = saved["method"]
     return params
 
 
@@ -226,8 +232,8 @@ def _disk(r):
 
 def rim_votes(gx, gy, mag, edge_thr, r_px, min_rim):
     """Circle centres voted for by the colour edges: every strong edge pixel votes r away along its gradient, both
-    ways. The grey Hough above misses rims with little brightness contrast (dark blue on its own side), and the
-    colour peaks give nothing inside a group of same-coloured pieces, where the colour fill is one flat plateau."""
+    ways. The masks' Hough misses rims inside a group of same-coloured pieces (the mask is one flat plateau there,
+    with no outline between them), and so do the colour peaks: these edges come from the picture itself."""
     h, w = mag.shape
     ys, xs = np.nonzero(mag > edge_thr)
     if len(xs) == 0:
@@ -262,7 +268,6 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     rejected: a list to receive the near misses, (color, u, v, rim, fill) of circles that failed min_rim or
     min_fill, for tuning: they show which threshold keeps a piece out."""
     sigma = max(r_px / 25, 1.0)
-    gray = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (0, 0), sigma)
     # Colour gradient: per pixel, the BGR channel with the strongest gradient. Grey alone misses
     # e.g. red/green boundaries, which have about the same brightness.
     blur = cv2.GaussianBlur(bgr, (0, 0), sigma).astype(np.float32)
@@ -297,18 +302,25 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     bright = cv2.filter2D(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32) / 255, -1, inner,
                           borderType=cv2.BORDER_CONSTANT)
 
-    # Candidates: colour-disk peaks + fixed-radius Hough on the grey image.
+    # Candidates: colour-disk peaks + fixed-radius Hough on each colour's mask.
     cands = []
     for f in fills.values():
         peaks = ((f >= cv2.dilate(f, _disk(0.3 * r_px))) & (f >= min_fill)).astype(np.uint8)
         # one candidate per peak region (flat plateaus, e.g. a white table, would give millions of pixels)
         n, _, stats, centroids = cv2.connectedComponentsWithStats(peaks)
         cands += [tuple(c) for c, st in zip(centroids[1:], stats[1:]) if st[cv2.CC_STAT_AREA] < (2 * r_px) ** 2]
-    circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1, minDist=0.5 * r_px, param1=60,
-                               param2=hough_votes or max(8, int(0.5 * r_px)),
-                               minRadius=int(r_px * 0.9), maxRadius=int(np.ceil(r_px * 1.1)))
-    if circles is not None:
-        cands += [(float(x), float(y)) for x, y, _ in circles[0]]
+    # Hough on the masks, not the grey image: a piece's outline in its own mask is a full-contrast step whatever the
+    # lighting, and the table, the cables and the background, with no piece colour, give it nothing to vote with.
+    # Blurred a little first, so a mask's speckled edge (glare, print texture) votes as one smooth outline.
+    for m in masks.values():
+        if not m.any():
+            continue
+        mimg = cv2.GaussianBlur(m.astype(np.uint8) * 255, (0, 0), sigma)
+        circles = cv2.HoughCircles(mimg, cv2.HOUGH_GRADIENT, dp=1, minDist=0.5 * r_px, param1=60,
+                                   param2=hough_votes or max(8, int(0.5 * r_px)),
+                                   minRadius=int(r_px * 0.9), maxRadius=int(np.ceil(r_px * 1.1)))
+        if circles is not None:
+            cands += [(float(x), float(y)) for x, y, _ in circles[0]]
     cands += rim_votes(gx, gy, mag, edge_thr, r_px, min_rim)
     # candidates this close end up at the same top face after the grid search: refine one of them
     cell = max(r_px / 3, 1.0)
@@ -322,7 +334,7 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     ang = np.linspace(0, 2 * np.pi, 72, endpoint=False)
     radii = r_px + np.linspace(-rim_band, rim_band, 7) * r_px
     cos, sin = np.cos(ang), np.sin(ang)
-    h, w = gray.shape
+    h, w = bgr.shape[:2]
     names = list(fills)
     fill_stack = np.stack([fills[c] for c in names])
     fill_flat = fill_stack.reshape(len(names), -1)
@@ -546,6 +558,150 @@ def view_from_calib(calib, camera="left", table_offset_mm=0.0, ppm=2.0):
         calib = StereoCalib.load(calib)
     cam, T = camera_table_pose(calib, camera)
     return TopView(cam.K, cam.dist, T, z_mm=PIECE_H_MM - table_offset_mm, ppm=ppm, image_size=cam.image_size)
+
+
+def warp_onto(img, src: TopView, grid: TopView):
+    """src's camera image remapped onto grid's top view (same plane height and scale): pixel (u, v) is then the same
+    table point in grid.warp(its own image) and in this. Black where src's camera doesn't see. The maps are kept on
+    grid, so a live loop builds them once."""
+    if abs(src.z - grid.z) > 1e-6 or src.ppm != grid.ppm:
+        raise ValueError("warp_onto: both top views must be at the same height and scale")
+    cache = grid.__dict__.setdefault("_onto", {})
+    if id(src) not in cache or cache[id(src)][0] is not src:
+        h, w = grid.maps.shape[:2]
+        gx, gy = np.meshgrid(grid.x0 + np.arange(w) / grid.ppm, grid.y1 - np.arange(h) / grid.ppm)
+        pts = np.stack([gx, gy, np.full_like(gx, grid.z)], -1).reshape(-1, 3)
+        cache[id(src)] = (src, src.project(pts).reshape(h, w, 2).astype(np.float32))
+    maps = cache[id(src)][1]
+    return cv2.remap(img, maps[..., 0], maps[..., 1], cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+
+
+def detect_fused(frames, views, params=None, rejected=None, tops=None):
+    """Both cameras at once: per colour, each camera's colour mask on the top-face plane (the left camera's top view
+    grid), smoothed to greyscale and combined by minimum, so a pixel is bright only where BOTH cameras see the colour
+    there. Top faces lie on that plane and coincide; each camera smears a piece's side towards itself, so the sides
+    (and anything off the plane) mostly drop out. Hough circle centres on each colour's combined image are the
+    pieces; each is kept if its fill (share of the top with the colour), rim (share of its outline where the colour
+    ends) and around (share of a ring outside it with the colour) pass params, best fill first, none closer than
+    1.6 r to a kept one (touching pieces are 2 r apart).
+
+    Returns (left pieces, right pieces), index-aligned: the same piece seen from each camera (table_mm the same, at
+    the top-face height; image_uv / view_uv per camera). rejected: (left list, right list) to receive the circles
+    that were nearly pieces, the same way. tops: the two cameras' own top views, if the caller already has them."""
+    p = DEFAULT_PARAMS | (params or {})
+    lv, rv = views
+    r_px = PIECE_D_MM / 2 * lv.ppm * size_of(p)
+    sigma = max(r_px / 25, 1.0)
+    top_l = lv.warp(frames[0]) if tops is None else tops[0]
+    top_r = warp_onto(frames[1], rv, lv)
+    seen_r = warp_onto(np.full(frames[1].shape[:2], 255, np.uint8), rv, lv) > 0
+    ml, mr = color_masks(top_l, p["colors"]), color_masks(top_r, p["colors"])
+    # brightness, so the greyscale image separates the top (lit from above) from the side (darker): per camera and
+    # colour, scaled so that colour's bright tops come out near 1
+    vl, vr = (cv2.cvtColor(t, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32) for t in (top_l, top_r))
+    h, w = top_l.shape[:2]
+    inner = _disk(0.8 * r_px).astype(np.float32)
+    inner /= inner.sum()
+    ring = _disk(1.45 * r_px).astype(np.float32)
+    hole = _disk(1.1 * r_px).astype(np.float32)
+    o = (ring.shape[0] - hole.shape[0]) // 2
+    ring[o:o + hole.shape[0], o:o + hole.shape[1]] -= hole
+    ring /= ring.sum()
+    ang = np.linspace(0, 2 * np.pi, 72, endpoint=False)
+    cos, sin = np.cos(ang), np.sin(ang)
+
+    def at(img, xs, ys):
+        xi = np.clip(np.rint(xs), 0, w - 1).astype(np.intp)
+        yi = np.clip(np.rint(ys), 0, h - 1).astype(np.intp)
+        return img[yi, xi]
+
+    def lit(mask, v):
+        """The colour mask weighted by brightness: ~1 on a lit top, less on the darker side, 0 off the colour."""
+        if not mask.any():
+            return np.zeros(mask.shape, np.float32)
+        bright = np.percentile(v[mask], 90)
+        return cv2.GaussianBlur(mask * np.clip(v / max(bright, 1.0), 0, 1), (0, 0), sigma)
+
+    # where the side meets the top: the outline arc facing the cameras (both look from about the same side), left out
+    # of the rim test, since the colour carries on into the side there and no outline shows
+    def facing(x, y):
+        tx, ty = lv.view_to_table(x, y)
+        out = np.zeros(len(ang), bool)
+        # each camera's side direction at this table point, in its own top view (same orientation and scale as the
+        # left one's grid, only shifted)
+        for s in (lv.smear(x, y), rv.smear((tx - rv.x0) * rv.ppm, (rv.y1 - ty) * rv.ppm)):
+            n = np.hypot(*s)
+            if n > 1e-6:
+                out |= (cos * s[0] + sin * s[1]) / n > np.cos(np.radians(60))
+        return out
+
+    cands = []          # (fill, color, x, y, rim, around)
+    for color in p["colors"]:
+        both = np.where(seen_r, np.minimum(lit(ml[color], vl), lit(mr[color], vr)), 0).astype(np.float32)
+        if both.max() < 0.3:
+            continue
+        grey = (both * 255).astype(np.uint8)
+        # the ALT variant scores each circle by how much of it the edges support (param2, 0..1): lenient here, the
+        # rim test below decides. Its param1 is the edge threshold of a Scharr filter on 0..255.
+        circles = cv2.HoughCircles(grey, cv2.HOUGH_GRADIENT_ALT, dp=1, minDist=0.5 * r_px, param1=150, param2=0.4,
+                                   minRadius=int(0.85 * r_px), maxRadius=int(np.ceil(1.15 * r_px)))
+        if circles is None:
+            continue
+        mask_both = np.where(seen_r, np.minimum(ml[color], mr[color]), 0).astype(np.float32)
+        fill_img = cv2.filter2D(mask_both, -1, inner, borderType=cv2.BORDER_CONSTANT)
+        for x, y, _ in circles.reshape(-1, 3):
+            fill = float(at(fill_img, np.array([x]), np.array([y]))[0])
+            # rim: on how many of the 72 rays (bar the arc facing the cameras) the greyscale steps down across the
+            # top's edge: the colour ends there, or the top gives way to its darker side
+            inside = at(both, x + 0.85 * r_px * cos, y + 0.85 * r_px * sin)
+            outside = at(both, x + 1.18 * r_px * cos, y + 1.18 * r_px * sin)
+            step = inside - outside > 0.25 * np.maximum(inside, 0.2)
+            yi, xi = int(round(y)), int(round(x))
+            rr = ring.shape[0] // 2
+            y0, y1, x0, x1 = max(yi - rr, 0), min(yi + rr + 1, h), max(xi - rr, 0), min(xi + rr + 1, w)
+            around = float((both[y0:y1, x0:x1] * ring[y0 - yi + rr:y1 - yi + rr, x0 - xi + rr:x1 - xi + rr]).sum())
+            cands.append([fill, color, float(x), float(y), step, around])
+
+    # the rim, once all the circles are known: bar the arc facing the cameras, and the arcs facing a touching
+    # neighbour of the same colour (no outline shows between two tops of one colour)
+    for c in cands:
+        fill, color, x, y, step, _ = c
+        rays = ~facing(x, y)
+        for o in cands:
+            d = np.hypot(o[2] - x, o[3] - y)
+            if o is not c and o[1] == color and o[0] >= p["min_fill"] and 1.6 * r_px <= d < 2.3 * r_px:
+                rays &= (cos * (o[2] - x) + sin * (o[3] - y)) / d < np.cos(np.radians(40))
+        c[4] = float(np.mean(step[rays])) if rays.sum() >= 12 else 0.0
+    cands = [tuple(c) for c in cands]
+    cands.sort(key=lambda c: c[0] * c[4], reverse=True)
+    kept, near = [], []
+    for c in cands:
+        fill, color, x, y, rim, around = c
+        if any(np.hypot(x - k[2], y - k[3]) < 1.6 * r_px for k in kept):
+            continue
+        if fill >= p["min_fill"] and rim >= p["min_rim"] and around <= p["max_around"]:
+            kept.append(c)
+        elif fill >= 0.4 and rim >= 0.3 and all(np.hypot(x - k[2], y - k[3]) > 1.4 * r_px for k in near):
+            near.append(c)
+    near = [c for c in near if all(np.hypot(c[2] - k[2], c[3] - k[3]) > 1.4 * r_px for k in kept)][:15]
+
+    def pair(c):
+        fill, color, x, y, rim, around = c
+        tx, ty = lv.view_to_table(x, y)
+        xyz = (tx, ty, lv.z)
+        out = []
+        for v in (lv, rv):
+            iu, iv = v.project([xyz])[0]
+            out.append(Piece(color, ((tx - v.x0) * v.ppm, (v.y1 - ty) * v.ppm), (float(iu), float(iv)), xyz,
+                             rim, fill, around))
+        return out
+    found = [pair(c) for c in kept]
+    if rejected is not None:
+        for c in near:
+            a, b = pair(c)
+            rejected[0].append(a)
+            rejected[1].append(b)
+    return [a for a, _ in found], [b for _, b in found]
 
 
 def matched_pieces(calib, left_pieces, right_pieces, max_mm=DEFAULT_PARAMS["match_mm"], max_dz=0.8 * PIECE_H_MM):
