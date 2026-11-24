@@ -18,8 +18,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# the trained model; YOLO_WEIGHTS (environment) or --yolo-weights (calib_app.py) points elsewhere
-WEIGHTS = Path(os.environ.get("YOLO_WEIGHTS", "/home/martin/Dokumentumok/yolo/runs/detect/train/weights/best.pt"))
+# the trained model (best.pt of the training run, optimizer stripped: ultralytics.utils.torch_utils.strip_optimizer);
+# YOLO_WEIGHTS (environment) or --yolo-weights (calib_app.py) points elsewhere
+WEIGHTS = Path(os.environ.get("YOLO_WEIGHTS", Path(__file__).resolve().parent / "models" / "pieces_yolo.pt"))
 IMGSZ = 1280            # the size it was trained at
 CONF = 0.5
 DRAW = {"red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0)}

@@ -9,8 +9,9 @@ venv/
 # participant data: never commit
 logs/
 
-# speech models (downloaded, ~1 GB)
-models/
+# speech models (downloaded, ~1 GB); the YOLO piece model is small and committed
+models/*
+!models/pieces_yolo.pt
 
 # calibration images: big, and specific to one lab session
 calib_data/pairs/
