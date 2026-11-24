@@ -3,12 +3,22 @@
 /arm/cmd     std_msgs/String JSON  {"id": 7, "op": "pick", "x": 120, "y": -40}   x, y: robot base frame (link1), mm
               z: table surface height at (x, y), mm, required for pick/place (GRASP_Z etc. are heights above it)
              op: pick | place | hover (x, y, z) | show | home | open | close | jog (joint, delta) | stop | wake
+                 | rest | torque_on
              jog: keyboard control, joint 1-4 turned by delta rad (|delta| <= kinematics.JOG_MAX), slowly; refused
                   past a joint limit, into the table or into the arm itself (kinematics.jog)
              air: true (optional) makes a dry run of the command: slow, pick / place stop AIR_MM above the piece
              hover: the fingertips go to the approach height over (x, y), always slowly, and stay there
              wake: slowly up to home from wherever the arm lies, never lower than it is: straight up like a home
                    when that works, otherwise joint by joint, which can sweep sideways (startup, clear table)
+             rest (q: [4 joint angles], torque_off: bool): slowly home, then down to q, a saved rest pose (where the
+                   arm lies by itself: robot_app.py saves it), along kinematics.rest_moves. torque_off: true then
+                   turns torque off, with nothing left to fall; it checks the torque service first, so a fake arm
+                   (none) fails before anything moves. Can sweep the table around the arm: clear it
+             torque_on: after a torque off, back to home without restarting the ROS side. The controller still
+                   holds the last command it had before the torque went off, and the driver keeps writing it to the
+                   motors, so turning torque straight back on would snap the arm there. So first a hold goal at
+                   where the limp arm lies now (the arm must lie still: resting, or held still), then torque on,
+                   a check that nothing jumped, then a wake. Fails without the driver's torque service (fake arm).
 /arm/status  std_msgs/String JSON  {"id": 7, "state": "started" | "done" | "failed", "reason": "..."}
 
 One command at a time: another one arriving meanwhile fails with "busy". stop cancels the running motion and
@@ -37,9 +47,11 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
+from std_srvs.srv import SetBool
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-from arm_node.kinematics import GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, jog, travel_moves, vertical, wake_moves
+from arm_node.kinematics import (GRASP_Z, HOME, LIFT, PLACE_Z, SHOW, jog, rest_moves, travel_moves, vertical,
+                                 wake_moves)
 
 JOINTS = ["joint1", "joint2", "joint3", "joint4"]
 OPEN, CLOSED = 0.019, -0.01     # gripper_left_joint limits, m; closing on a piece just stalls on it
@@ -54,6 +66,10 @@ RESULT_EXTRA_S = 5.0            # arm goal result: trajectory duration + this
 GRIP_RESULT_S = 5.0             # gripper goal result
 ARRIVE_RAD = 0.15               # a finished move must have brought every joint this close to its target
 JOINT_STALE_S = 1.0             # /joint_states: without a reading fresher than this, nothing may move
+TORQUE_SERVICE = "/dynamixel_hardware_interface/set_dxl_torque"     # what ./lab.sh torque-off calls
+TORQUE_ANSWER_S = 5.0           # the torque service answers this fast
+HOLD_RAD = 0.05                 # torque_on: the limp arm may drift this much during the hold, no more
+TORQUE_SETTLE_S = 0.5           # torque_on: after torque on, wait this long, then check that nothing jumped
 
 
 def trajectory(q_from, points, speed=MAX_SPEED):
@@ -83,6 +99,7 @@ class ArmNode(Node):
         super().__init__("arm_node")
         self.arm = ActionClient(self, FollowJointTrajectory, "/arm_controller/follow_joint_trajectory")
         self.gripper = ActionClient(self, GripperCommand, "/gripper_controller/gripper_cmd")
+        self.torque = self.create_client(SetBool, TORQUE_SERVICE)
         self.status = self.create_publisher(String, "/arm/status", 10)
         self.q = None                   # current arm joints, from /joint_states
         self.q_at = None                # time.monotonic() when the last valid q came in
@@ -215,9 +232,13 @@ class ArmNode(Node):
 
     async def run(self, cmd):
         op, air = cmd["op"], bool(cmd.get("air"))
-        self.speed = AIR_SPEED if air or op in ("hover", "wake", "jog") else MAX_SPEED
+        self.speed = AIR_SPEED if air or op in ("hover", "wake", "jog", "rest", "torque_on") else MAX_SPEED
         if op == "home":
             await self.travel(HOME, self.table_z)
+        elif op == "rest":
+            await self.rest(cmd.get("q"), bool(cmd.get("torque_off")))
+        elif op == "torque_on":
+            await self.torque_on()
         elif op == "wake":
             for points in wake_moves(self.joints(), self.table_z, self.op_xy):
                 await self.move(points)
@@ -264,6 +285,60 @@ class ArmNode(Node):
             self.op_xy = None
         else:
             raise ValueError(f"unknown op {op!r}")
+
+    def check_torque_service(self):
+        if not self.torque.service_is_ready():
+            raise RuntimeError(f"no torque service ({TORQUE_SERVICE}): a fake arm has none, or the driver is down")
+
+    async def set_torque(self, on):
+        res = await self.await_ft(self.torque.call_async(SetBool.Request(data=on)), TORQUE_ANSWER_S,
+                                  f"torque {'on' if on else 'off'}")
+        if not res.success:
+            raise RuntimeError(f"the driver would not turn torque {'on' if on else 'off'}: {res.message}")
+
+    async def rest(self, q, torque_off):
+        """Lay the arm down at the rest pose q, then torque off if asked (the docstring's rest)."""
+        if q is None:
+            raise ValueError("rest needs q: the saved rest pose (robot_app.py: Save as rest)")
+        if torque_off:
+            self.check_torque_service()
+        for points in rest_moves(self.joints(), q, self.table_z, self.op_xy):   # all planned before anything moves
+            await self.move(points)
+        if torque_off:
+            if self.stopped:
+                raise RuntimeError("stopped")
+            await self.set_torque(False)
+
+    async def torque_on(self):
+        """Torque back on where the limp arm lies, then wake (the docstring's torque_on)."""
+        self.check_torque_service()
+        q = list(self.joints())
+        # the controller's command := where the arm is: torque on then holds it there instead of snapping back
+        await self.move([q])
+        drift = max(abs(a - b) for a, b in zip(self.joints(), q))
+        if drift > HOLD_RAD:
+            raise RuntimeError(f"the arm moved {drift:.2f} rad during the hold (over {HOLD_RAD:.2f}): let it rest "
+                               "on something, or hold it still, and try again. Torque is still off")
+        if self.stopped:
+            raise RuntimeError("stopped")
+        await self.set_torque(True)
+        await self.sleep(TORQUE_SETTLE_S)
+        jump = max(abs(a - b) for a, b in zip(self.joints(), q))
+        if jump > ARRIVE_RAD:
+            raise RuntimeError(f"the arm jumped {jump:.2f} rad when torque came on: STOP, hold the arm, torque off "
+                               "and restart ./lab.sh arm")
+        for points in wake_moves(self.joints(), self.table_z, self.op_xy):
+            await self.move(points)
+
+    async def sleep(self, seconds):
+        """rclpy's stand-in for asyncio.sleep: a one-shot timer settles a future."""
+        done = rclpy.task.Future(executor=self.executor)
+        timer = self.create_timer(seconds, lambda: done.done() or done.set_result(None))
+        try:
+            await done
+        finally:
+            timer.cancel()
+            self.destroy_timer(timer)
 
     async def travel(self, q, table_z):
         """Travel move with a clearance check, lifting straight up first when the arm already sits low."""

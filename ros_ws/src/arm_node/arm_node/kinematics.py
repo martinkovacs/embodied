@@ -200,6 +200,31 @@ def wake_moves(q, table_z=0.0, op_xy=None):
         return [wake_path(q)]
 
 
+def check_rest(rest):
+    """The rest pose as 4 floats, or ValueError: a saved pose (the arm's own joints, read while it lay there) that
+    no command could reach. Within the joint limits plus wake_path's 0.05 rad (a limp arm on its end stop), and
+    with a way up from it, which is the way down to it."""
+    try:
+        rest = [float(v) for v in rest]
+    except (TypeError, ValueError):
+        raise ValueError(f"rest pose: 4 joint angles, got {rest!r}") from None
+    if len(rest) != 4:
+        raise ValueError(f"rest pose: 4 joint angles, got {len(rest)}")
+    wake_path(rest)                                     # nan, past the limits, or no way up: its ValueError
+    return rest
+
+
+def rest_moves(q, rest, table_z=0.0, op_xy=None):
+    """The trajectories [[q]] that lay the arm down at the rest pose (a saved one, where the arm lies by itself):
+    a travel to HOME (a lift first if it sits low), then a wake from `rest` played backwards. That is the way up
+    from it that never goes lower than the rest pose itself, nor into the arm tighter than it, so going down it
+    only ever touches what the arm touches lying there. The same shortcut as wake_path: it knows nothing about
+    pieces in the way, so the table around the arm has to be clear."""
+    rest = check_rest(rest)
+    down = [*reversed(wake_path(rest)[:-1]), tuple(rest)]   # wake_path ends at HOME, where the travel leaves the arm
+    return [*travel_moves(q, HOME, table_z, op_xy), down]
+
+
 JOG_MAX = 0.2                   # rad: the largest single keyboard step
 
 
@@ -313,6 +338,23 @@ if __name__ == "__main__":
     assert wake_moves(low) == [lift_path(low, 0.0), [HOME]]
     lying = (0.0, 1.5, -1.2, -0.2)                              # one it can't: joint by joint
     assert wake_moves(lying) == [wake_path(lying)]
+
+    # laying down at a saved rest pose: home, then down to it, never lower than it, never into the arm tighter
+    for rest in ((0.0, 1.0, 1.43, 0.0), (0.0, 1.5, 1.4, -1.0), (0.0, 0.85, 0.6, -1.45), lying):   # folded on the
+        moves = rest_moves(home, rest)                                                         # base, lying out
+        assert moves[0] == [HOME] and moves[-1][-1] == rest, moves
+        floor, gap = min(heights(rest)) - 2.0, min(SELF_CLEAR, self_gap(rest)) - 1.0
+        for a, b in zip([home, *moves[-1]], moves[-1]):
+            for c in (tuple(m + (w - m) * i / 50 for m, w in zip(a, b)) for i in range(51)):
+                assert min(heights(c)) > floor - 1.0 and self_gap(c) > gap, (rest, c)
+        assert tuple(wake_moves(rest)[-1][-1]) == home          # and it wakes from there again
+    assert rest_moves(low, lying)[0] == lift_path(low, 0.0)     # a low arm lifts first, as a home does
+    for bad in ((0.0, 1.0, 1.4), (0.0, 3.0, 0.0, 0.0), (0.0, float("nan"), 0.0, 0.0), "rest", None):
+        try:
+            check_rest(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"rest pose {bad!r} should be refused")
 
     assert jog(home, 1, 0.1) == [0.1, *HOME[1:]]                # keyboard: a plain step turns one joint
     assert jog((3.1, *HOME[1:]), 1, 0.1)[0] == pi               # the step past a limit ends on it...

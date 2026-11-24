@@ -5,7 +5,9 @@
 #                              (--fake first: simulated joints and synthetic images; then runner.py's options)
 #   ./lab.sh arm [--fake]      only the ROS side, left running (--fake: simulated joints, no arm)
 #   ./lab.sh cmd '{"op": "home"}'   send the arm one command and print its answer (ops: arm_node.py's docstring)
-#   ./lab.sh torque-off        let the arm be moved by hand (afterwards restart ./lab.sh arm)
+#   ./lab.sh torque-off        let the arm be moved by hand (afterwards restart ./lab.sh arm). Gentler, with the
+#                              ROS side running: robot_app.py's Rest & torque off lays it down at its saved rest
+#                              pose first (calib_data/rest_pose.json; Save as rest)
 #   ./lab.sh usb               install the arm's USB rule (setup does it; needs sudo)
 #   ./lab.sh python X.py ...   run one of our Python scripts
 set -euo pipefail
@@ -255,7 +257,8 @@ if bad:
     sys.exit("these motors didn't take it: " + "; ".join(bad))
 EOF
     fi
-    echo "Torque off: the arm can be moved by hand. Afterwards restart ./lab.sh arm (don't turn torque back on)."
+    echo "Torque off: the arm can be moved by hand. Afterwards rest it and run ./lab.sh cmd '{\"op\": \"torque_on\"}'"
+    echo "(holds it where it lies, then rises to home), or restart ./lab.sh arm. Never turn torque back on directly."
 }
 
 cmd_python() {

@@ -41,7 +41,7 @@ import calib_app as ca
 import pieces
 import robot_frame      # first: puts ros_ws/src/arm_node on sys.path
 from arm_node.kinematics import (FOREARM, GRASP_Z, HOME, J1_X, J2_Z, LIFT, PLACE_Z, SHOW, TOOL, UP_X, UP_Z,  # noqa: E402
-                                 fk, ik, jog, travel_moves, vertical, wake_moves)
+                                 check_rest, fk, ik, jog, rest_moves, travel_moves, vertical, wake_moves)
 from calib_app import SIDES, Engine
 from cameras import ROOT
 
@@ -50,7 +50,7 @@ PORT = 8082             # calib_app.py is 8080, the runner's panel 8081
 OPEN, CLOSED = 0.019, -0.01
 MAX_SPEED, AIR_SPEED, AIR_MM = 0.6, 0.25, 40.0
 TORQUE_SERVICE = "/dynamixel_hardware_interface/set_dxl_torque"
-TIMEOUT_S = {"wake": 150.0}             # a joint-by-joint wake is slow; every other command
+TIMEOUT_S = {"wake": 150.0, "torque_on": 160.0, "rest": 120.0}  # a joint-by-joint wake is slow; every other
 CMD_TIMEOUT_S = 60.0                    # (runner.py's ARM_TIMEOUT_S)
 STOP_CONFIRM_S = 8.0                    # arm_node's worst case to confirm a stop (runner.py's STOP_CONFIRM_S)
 JOINT_STALE_S = 1.0
@@ -258,8 +258,10 @@ class SimLink:
             return self._moves([[jog(q, int(cmd["joint"]), float(cmd["delta"]), self.table_z)]], speed)
         if op in ("home", "show"):
             return self._moves(travel_moves(q, HOME if op == "home" else SHOW, self.table_z, self.op_xy), speed)
-        if op == "wake":
-            return self._moves(wake_moves(q, self.table_z, self.op_xy), speed)
+        if op in ("wake", "torque_on"):     # the simulated arm never lets go: torque_on is just its wake
+            return self._moves(wake_moves(q, self.table_z, self.op_xy), AIR_SPEED)
+        if op == "rest":                    # and rest just lays it down
+            return self._moves(rest_moves(q, cmd["q"], self.table_z, self.op_xy), AIR_SPEED)
         x, y, z = float(cmd["x"]), float(cmd["y"]), float(cmd["z"])
         if op == "hover":
             target = vertical(x, y, z + GRASP_Z + LIFT, z + GRASP_Z + LIFT)[0]
@@ -338,6 +340,26 @@ class Robot:
         self.target = None              # {"kind": "piece" | "spot", "x", "y", "color"}
         self.holding = None
         self.points = []                # fit: [(table xyz, fingertip robot xyz)]
+        self.rest_path = E.data / "rest_pose.json"
+        self.rest = None                # the saved rest pose [q1..q4], or None
+        try:
+            self.rest = check_rest(json.loads(self.rest_path.read_text())["q"])
+        except FileNotFoundError:
+            pass
+        except Exception as e:          # a broken file: no rest pose rather than a wrong one
+            log(f"ignoring {self.rest_path}: {e}")
+
+    def save_rest(self):
+        """The arm's current joints become the rest pose (works with torque off: lay it there by hand, or let it
+        fold by itself). ValueError without fresh joints, or for a pose no command could reach."""
+        q, _ = self.joints()
+        if q is None:
+            raise ValueError("no fresh /joint_states from the arm")
+        rest = [round(v, 3) for v in check_rest(q)]
+        self.rest_path.parent.mkdir(parents=True, exist_ok=True)
+        self.rest_path.write_text(json.dumps({"q": rest}, indent=2))
+        self.rest = rest
+        return rest
 
     def load_frame(self):
         path = self.path
@@ -388,8 +410,8 @@ class Robot:
         with the reason if it failed."""
         if self.busy:
             raise RuntimeError(f"still running: {self.busy}")
-        if self.torque_off:
-            raise RuntimeError("torque is off: restart ./lab.sh arm first")
+        if self.torque_off and op not in ("torque_on", "stop"):
+            raise RuntimeError("torque is off: Torque on & home first (or restart ./lab.sh arm)")
         cmd, what = {"op": op, **fields}, " ".join([op, *(f"{k} {v}" for k, v in fields.items())])
         if xy is not None:
             if self.T is None:
@@ -416,6 +438,10 @@ class Robot:
             self.last = f"{what}: failed: {s.get('reason', s.get('state'))}"
             raise RuntimeError(s.get("reason", s.get("state")))
         self.last = f"{what}: done"
+        if op == "torque_on":
+            self.torque_off = False     # only on success: a failed one may have left torque either way
+        elif op == "rest" and fields.get("torque_off") and self.link.real:
+            self.torque_off = True
 
     async def stop(self):
         """(confirmed, reason). Not confirmed: assume the arm may still be moving."""
@@ -612,9 +638,13 @@ def robot_panel(E: Engine, R: Robot):
             with ui.card().classes("w-full gap-2"):
                 ui.label("Arm").classes("text-base font-medium")
                 status = ui.label().classes("text-sm whitespace-pre-line font-mono")
-                torque_banner = ui.label("Torque is off: the arm can be moved by hand. When done, hold the arm, Ctrl-C "
-                                         "./lab.sh arm and start it again; this app reconnects by itself and the "
-                                         "buttons come back.").classes("text-sm text-amber-400")
+                with ui.column().classes("w-full gap-1") as torque_banner:
+                    ui.label("Torque is off: the arm can be moved by hand. When done, let it rest (or hold it still) "
+                             "and press Torque on & home: it holds where it lies, then rises slowly to home and can "
+                             "sweep sideways, so no pieces near it. Or restart ./lab.sh arm.") \
+                        .classes("text-sm text-amber-400")
+                    b_torque_on = ui.button("Torque on & home", icon="power", on_click=lambda: cmd("torque_on")) \
+                        .props("dense color=warning")
                 with ui.row().classes("w-full items-center gap-2"):
                     ui.switch("Air (dry run)").bind_value(R, "air").tooltip(
                         f"Every move slow; picks and places stop {AIR_MM:.0f} mm above the table, nothing is gripped")
@@ -628,6 +658,17 @@ def robot_panel(E: Engine, R: Robot):
                     b_open = ui.button("Open gripper", icon="open_in_full", on_click=lambda: cmd("open")).props("dense")
                     b_close = ui.button("Close gripper", icon="close_fullscreen", on_click=lambda: cmd("close")) \
                         .props("dense")
+                with ui.row().classes("w-full items-center gap-2"):
+                    b_save_rest = ui.button("Save as rest", icon="bookmark_add", on_click=lambda: save_rest()) \
+                        .props("dense flat").tooltip("The arm's pose now becomes its rest pose. Works with torque "
+                                                     "off: let the arm fold into its own rest, then save")
+                    b_rest = ui.button("Go to rest", icon="airline_seat_flat", on_click=lambda: rest(False)) \
+                        .props("dense").tooltip("Slowly home, then down to the rest pose. Can sweep the table "
+                                                "around the arm: clear it")
+                    b_rest_off = ui.button("Rest & torque off", icon="power_off", on_click=lambda: rest(True)) \
+                        .props("dense color=warning").tooltip("Go to rest, then torque off: lying there, it has "
+                                                              "nowhere to fall")
+                rest_note = ui.label().classes("text-xs opacity-70 font-mono")
                 b_stop = ui.button("STOP", icon="pan_tool", on_click=lambda: stop()) \
                     .props("color=negative size=lg").classes("w-full")
                 with ui.row().classes("w-full items-center gap-2 no-wrap"):
@@ -669,6 +710,26 @@ def robot_panel(E: Engine, R: Robot):
             ui.notify(f"{op} failed: {e}", type="negative", multi_line=True)
             return False
 
+    def save_rest():
+        try:
+            rest = R.save_rest()
+        except ValueError as e:
+            ui.notify(f"Not saved: {e}", type="negative", multi_line=True)
+            return
+        log(f"rest pose saved: {rest}")
+        ui.notify(f"Rest pose saved: {rest}", type="positive")
+
+    async def rest(torque_off):
+        try:
+            await R.do("rest", q=R.rest, torque_off=torque_off)
+        except Exception as e:
+            log(f"rest FAILED: {e}")
+            ui.notify(f"Go to rest failed: {e}", type="negative", multi_line=True)
+            return
+        log(R.last)
+        ui.notify("At rest, torque off: move the arm by hand." if torque_off and R.link.real else "At rest.",
+                  type="warning" if torque_off else "positive")
+
     async def key(e):
         """Keyboard control (the Keyboard switch): a held key repeats, but a step only starts once the last one ended."""
         if not kb.value or not e.action.keydown:
@@ -695,7 +756,7 @@ def robot_panel(E: Engine, R: Robot):
         if not R.link.connected:
             return "no rosbridge connection: is ./lab.sh arm running?"
         if R.torque_off:
-            return "torque is off: hold the arm, restart ./lab.sh arm"
+            return "torque is off: Torque on & home first"
         if R.busy:
             return f"still running: {R.busy}"
         if t is None:
@@ -842,10 +903,16 @@ def robot_panel(E: Engine, R: Robot):
             holding.text = (f"Holding: {R.holding}" + (" (air: nothing gripped)" if R.air else "")) if R.holding else ""
             status.text = status_text()
             torque_banner.set_visibility(R.torque_off)
+            b_torque_on.set_enabled(R.link.connected and not R.busy)
             air_note.text = "" if R.air else "REAL moves: picks grip, places let go"
             air_note.classes(replace="text-sm text-red-400 font-medium")
             for b in (b_wake, b_home, b_show, b_open, b_close):
                 b.set_enabled(R.can_move)
+            for b in (b_rest, b_rest_off):
+                b.set_enabled(R.can_move and R.rest is not None)
+            b_save_rest.set_enabled(R.joints()[0] is not None and not R.busy)
+            rest_note.text = ("rest pose: " + " ".join(f"{v:+.2f}" for v in R.rest) + " rad" if R.rest else
+                              "no rest pose saved yet: let the arm fold into its rest (torque off), then Save as rest")
             b_stop.set_enabled(R.link.connected)
             for b, op in ((b_hover, "hover"), (b_pick, "pick"), (b_place, "place")):
                 b.set_enabled(why_not(op) is None)
@@ -871,17 +938,20 @@ def robot_panel(E: Engine, R: Robot):
 
 
 def fit_section(E: Engine, R: Robot):
-    ui.label("1. The board lies where it was for the calibration capture. Hold the arm, press Torque off, close the "
-             "fingers by hand so the fingertips meet.\n"
+    ui.label("1. The board lies where it was for the calibration capture, clear of the arm. Press Rest & torque "
+             "off (or hold the arm and press Torque off), close the fingers by hand so the fingertips meet.\n"
              "2. Touch the fingertips to a board corner, click that corner in the picture (or type it, mm from the "
              "(0, 0) corner the axes mark), Add point.\n"
              "3. 4-6 corners spread over the board, then Save. Accept if every error is under "
              f"{robot_frame.ACCEPT_MM:.0f} mm.\n"
              "Check a saved fit: touch new corners; the 'saved' column is the --check.\n"
-             "4. Restart ./lab.sh arm: lay the arm down, hands off, Ctrl-C, start it again.") \
+             "4. Rest the arm (or hold it still) and press Torque on & home in the Arm card, or restart ./lab.sh arm.") \
         .classes("text-xs opacity-70 whitespace-pre-line")
     with ui.row().classes("items-center gap-2"):
-        b_torque = ui.button("Torque off", icon="power_off").props("dense color=warning")
+        b_rest = ui.button("Rest & torque off", icon="airline_seat_flat", on_click=lambda: rest()) \
+            .props("dense color=warning").tooltip("To the saved rest pose (Arm card), then torque off")
+        b_torque = ui.button("Torque off", icon="power_off").props("dense flat").tooltip(
+            "Right where it is: hold the arm first, it falls. For when it can't lay itself down")
         live = ui.label().classes("text-sm font-mono")
     with ui.row().classes("items-end gap-2 no-wrap"):
         fx = ui.number("table x mm", format="%.1f").classes("w-28")
@@ -902,12 +972,22 @@ def fit_section(E: Engine, R: Robot):
 
     with ui.dialog() as confirm, ui.card():
         ui.label("Hold the arm first: with torque off its motors let go and it falls.").classes("font-medium")
-        ui.label("Afterwards restart ./lab.sh arm (don't turn torque back on: the arm would snap back to its last "
-                 "command).").classes("text-sm")
+        ui.label("Afterwards use Torque on & home in the Arm card, or restart ./lab.sh arm (never turn torque "
+                 "back on by hand: the arm would snap back to its last command).").classes("text-sm")
         with ui.row().classes("w-full justify-end"):
             ui.button("Cancel", on_click=confirm.close).props("flat")
             ui.button("I'm holding it: torque off", on_click=lambda: torque_off()).props("color=warning")
     b_torque.on_click(confirm.open)
+
+    async def rest():
+        try:
+            await R.do("rest", q=R.rest, torque_off=True)
+        except Exception as e:
+            log(f"rest FAILED: {e}")
+            ui.notify(f"Rest & torque off failed: {e}", type="negative", multi_line=True)
+            return
+        log(R.last)
+        ui.notify("At rest, torque off: move the arm by hand.", type="warning")
 
     async def torque_off():
         confirm.close()
@@ -989,6 +1069,7 @@ def fit_section(E: Engine, R: Robot):
             else:
                 live.text = f"fingertips at robot ({tip[0]:.0f}, {tip[1]:.0f}, {tip[2]:.0f})"
             b_torque.set_enabled(R.link.connected and not R.busy and not R.torque_off)
+            b_rest.set_enabled(R.can_move and R.rest is not None)
             b_add.set_enabled(tip is not None)
 
     st = Fit()
