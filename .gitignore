@@ -18,3 +18,6 @@ calib_data/pairs/
 calib_data/debug/
 # what calib_gui.py saves in test mode
 synthetic/gui/
+
+# YOLO training pictures (yolo_capture.py): big
+yolo_data/
