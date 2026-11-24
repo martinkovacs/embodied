@@ -444,6 +444,8 @@ class Engine:
             cv2.imwrite(str(out / f"{side}_detection.jpg"), vis, jpg)
             cv2.imwrite(str(out / f"{side}_top.jpg"),
                         pieces.draw_top(det["tops"][i], everything, misses, view.ppm, alone + outside), jpg)
+            cv2.imwrite(str(out / f"{side}_edges.jpg"),
+                        pieces.draw_edges(det["tops"][i], view, params, everything, misses, alone + outside), jpg)
             for color in params["colors"]:
                 cv2.imwrite(str(out / f"{side}_mask_{color}.jpg"), pieces.mask_view(img, params, color), jpg)
             cams[side] = {"found_paired": [info(p) for p in found if not any(p is q for q in alone)],
@@ -467,7 +469,9 @@ class Engine:
             f"Debug snapshot {out.name}\n{note}\n\n{summary}\n\n"
             "left.png / right.png: the camera pictures. *_detection.jpg: coloured = both cameras agree, grey ? = one "
             "camera only (why), thin grey with scores = near misses. *_top.jpg: the top view the detector works on. "
-            "*_mask_<colour>.jpg: what passes each colour's thresholds. report.json: all of it in numbers.\n"
+            "*_edges.jpg: the edges the detector sees (white; yellow = from the colour mask only) and each piece's "
+            "rim test (green dot = the ray met an edge, red = not). *_mask_<colour>.jpg: what passes each colour's "
+            "thresholds. report.json: all of it in numbers.\n"
             f"Reopen: ./lab.sh python calib_app.py --snapshot {out}\n")
         zip_path = shutil.make_archive(str(out), "zip", root_dir=out)
         return Path(zip_path), summary
@@ -619,9 +623,13 @@ def code_version():
 
 # ---------------------------------------------------------------- pictures
 
+_edges_cache = {}      # side -> (key, picture): the edge view, made once per detection (it takes a moment)
+
+
 def picture(E: Engine, name, mask=None, misses=False, lone=False):
     """One picture for the UI as BGR: calib_<side> (live, board corners, coverage, table axes), cam_<side>
-    (detection on the camera image), top_<side> (detection on the top view). None if there's nothing to show."""
+    (detection on the camera image), top_<side> (detection on the top view), edges_<side> (the edges the detector
+    sees on the top view, with each piece's rim test: pieces.draw_edges). None if there's nothing to show."""
     kind, side = name.split("_")
     i = SIDES.index(side)
     with E.lock:
@@ -649,6 +657,20 @@ def picture(E: Engine, name, mask=None, misses=False, lone=False):
     if base is None:
         return None
     view = views[i] if views else None
+    if kind == "edges":
+        if view is None:
+            return None
+        # on the frame the detection ran on, so the rim dots match its pieces; without a detection, the live frame
+        # every 2 s
+        key = (det["key"], E.params_id) if det else ("live", E.params_id, int(time.monotonic() // 2))
+        hit = _edges_cache.get(side)
+        if hit and hit[0] == key:
+            return hit[1]
+        img = det["frames"][i] if det else base
+        vis = pieces.draw_edges(view.warp(img), view, params, det["found"][i] if det else [],
+                                det["misses"][i] if det else [], det["lone"][i] if det else [])
+        _edges_cache[side] = (key, vis)
+        return vis
     if kind == "top":
         if view is None:
             return None
@@ -968,7 +990,12 @@ def detection_panel(E):
     with ui.row().classes("w-full no-wrap gap-3 items-start"):
         with ui.column().classes("flex-1 min-w-0 gap-2"):
             with ui.row().classes("w-full items-center gap-2"):
-                kind = ui.toggle({"cam": "Camera", "top": "Top view"}, value="cam").props("dense")
+                kind = ui.toggle({"cam": "Camera", "top": "Top view", "edges": "Edges"}, value="cam").props("dense") \
+                    .tooltip("Edges: the top view as the detector sees it. White = an edge in the picture, yellow = "
+                             "an edge only the colour mask has. Around each piece and near miss, a dot per rim ray: "
+                             "green = it met an edge, red = not (rim = share of green). The line points to where "
+                             "its side shows, towards the camera: of a piece found twice, the circle on that line "
+                             "is on its side")
                 side = ui.toggle({"left": "Left", "right": "Right", "both": "Both"}, value="left").props("dense")
                 mask = ui.select({"": "no mask", **{c: f"{c} mask" for c in pieces.COLORS}}, value="") \
                     .props("dense outlined").classes("w-36").tooltip("Only the pixels that pass a colour's thresholds")
@@ -1069,7 +1096,8 @@ def detection_panel(E):
         if not teach_on.value:
             return
         try:
-            msg = await run.io_bound(E.teach, s, kind.value, e.image_x, e.image_y, teach_color.value or None)
+            msg = await run.io_bound(E.teach, s, "cam" if kind.value == "cam" else "top", e.image_x, e.image_y,
+                                     teach_color.value or None)
         except ValueError as err:
             ui.notify(str(err), type="warning")
             return
@@ -1097,7 +1125,7 @@ def detection_panel(E):
                 img.set_source(f"/v2img/{kind.value}_{s}.jpg{q}")
             if full["open"]:
                 s = "right" if side.value == "right" else "left"
-                full_title.text = f"{s} camera · {'top view' if kind.value == 'top' else 'image'}"
+                full_title.text = f"{s} camera · {dict(cam='image', top='top view', edges='edges')[kind.value]}"
                 full_img.set_source(f"/v2img/{kind.value}_{s}.jpg{q}")
             if d:
                 rows = [{"c": p.color, "xyz": f"{st[0]:.0f}, {st[1]:.0f}, {st[2]:.0f}"} for p, st in d["matched"]

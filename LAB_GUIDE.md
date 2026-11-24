@@ -158,6 +158,10 @@ is a piece only one camera finds; the runner ignores those.
 - A piece is missing: switch **Near misses** on. The grey circle with scores shows which limit keeps it out. First
   try *rim* 0.5 instead of 0.6. A colour isn't found: click the middle of that piece's top (*Click to tune*).
   Press **Save** after any change.
+- A piece is missing because of *rim*, or a piece is found twice: switch the view to **Edges**. White is what counts
+  as an outline. Around each circle a dot per check: green = outline found there, red = not. A missing piece with a
+  mostly red ring has too weak an outline: lower *edges ≥*, or switch on *Outline from the mask too*. A piece found
+  twice shows two circles; the one on the thin line (towards the camera) sits on the piece's side.
 - Then press the **bug button**, **Save snapshot**, and send the zip from `calib_data/debug/`: with it the
   thresholds can be checked away from the lab.
 
