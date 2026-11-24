@@ -14,6 +14,7 @@ Usage:
 import argparse
 import copy
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,9 +46,17 @@ COLORS = {
 # rim_band: how far from the expected radius (share of it) an edge may lie and still count as the rim.
 # size: scales the piece radius the detector looks for (a top that looks bigger or smaller than 35 mm in the top view).
 # max_dz_mm: how far from the top-face height the two cameras' sighting may triangulate and still be a piece.
+# yolo: the trained model finds the pieces and the circle fit places them (yolo_fit); on by default since on the lab
+# snapshot of 2026-11-24 it found exactly the 6 pieces in both cameras at every setting tried, the colour detector
+# only at one (and 7 to 39 with these colours). yolo_conf: YOLO boxes less confident than this are dropped.
 DEFAULT_PARAMS = {"colors": COLORS, "min_fill": 0.55, "min_rim": 0.6, "max_around": 0.9, "match_mm": 20.0,
-                  "edge_pct": 90.0, "mask_edges": True, "rim_band": 0.12, "size": 1.0, "max_dz_mm": 0.8 * PIECE_H_MM}
-FLOAT_PARAMS = ("min_fill", "min_rim", "max_around", "match_mm", "edge_pct", "rim_band", "size", "max_dz_mm")
+                  "edge_pct": 90.0, "mask_edges": True, "rim_band": 0.12, "size": 1.0, "max_dz_mm": 0.8 * PIECE_H_MM,
+                  "yolo": True, "yolo_conf": 0.5}
+FLOAT_PARAMS = ("min_fill", "min_rim", "max_around", "match_mm", "edge_pct", "rim_band", "size", "max_dz_mm",
+                "yolo_conf")
+YOLO = None     # the yolo_pieces.Detector detect_pieces uses with params["yolo"]; made on first use
+YOLO_ERROR = None   # why YOLO can't run here (no ultralytics, no model): the colour detector stands in
+_YOLO_LOCK = threading.Lock()   # the runner detects both cameras at once: one model, not one per thread
 DRAW = {"red": (0, 0, 255), "blue": (255, 0, 0), "green": (0, 180, 0)}
 
 
@@ -60,8 +69,9 @@ def load_params(path=None):
             if name in params["colors"]:
                 params["colors"][name] |= {k: tuple(v) if k == "h" else v for k, v in c.items() if k in ("h", "s", "v")}
         params |= {k: float(saved[k]) for k in FLOAT_PARAMS if k in saved}
-        if "mask_edges" in saved:
-            params["mask_edges"] = bool(saved["mask_edges"])
+        for k in ("mask_edges", "yolo"):
+            if k in saved:
+                params[k] = bool(saved[k])
     return params
 
 
@@ -78,6 +88,7 @@ class Piece:
     rim: float                          # fraction of the rim with a matching edge
     fill: float                         # fraction of the top disk with the piece colour
     around: float = 0.0                 # fraction of a ring just outside the top with the piece colour
+    conf: float | None = None           # YOLO's confidence, for a piece YOLO found
 
 
 class TopView:
@@ -453,14 +464,69 @@ def detect_pieces(img, view: TopView | None = None, radius_px=None, params=None,
         return [Piece(c, (u, v), (u, v), None, rim, fill) for c, u, v, rim, fill in found]
     top = view.warp(img) if top is None else top
 
-    def piece(c, u, v, rim, fill, around=0.0):
+    def piece(c, u, v, rim, fill, around=0.0, conf=None):
         x, y = view.view_to_table(u, v)
         iu, iv = view.project([[x, y, view.z]])[0]
-        return Piece(c, (u, v), (float(iu), float(iv)), (x, y, view.z), rim, fill, around)
-    found = detect(top, PIECE_D_MM / 2 * view.ppm * size_of(params), smear=view.smear, rejected=misses, **kw)
+        return Piece(c, (u, v), (float(iu), float(iv)), (x, y, view.z), rim, fill, around, conf)
+    r_px = PIECE_D_MM / 2 * view.ppm * size_of(params)
+    if (DEFAULT_PARAMS | (params or {}))["yolo"]:
+        res = yolo_fit(img, top, view, r_px, params, kw)
+        if res is not None:
+            found, low = res
+            if rejected is not None:
+                rejected += [piece(*m) for m in low]
+            return [piece(*f) for f in found]
+    found = detect(top, r_px, smear=view.smear, rejected=misses, **kw)
     if rejected is not None:
         rejected += [piece(*m) for m in misses]
     return [piece(*f) for f in found]
+
+
+def yolo_fit(img, top, view: TopView, r_px, params, kw):
+    """YOLO finds the pieces and their colours in the camera image; the circle fit (detect's probe) then puts each
+    on its top face in the top view, so the position is as exact as the colour detector's. A box whose colour can't
+    be fitted keeps the YOLO estimate (rim and fill 0), and so does the second of two boxes whose fits land on the same
+    piece (two touching pieces of one colour). Returns (found, near misses) as [(color, u, v, rim, fill, around,
+    conf)] in top-view pixels: near misses are boxes YOLO found with less than yolo_conf but more than half of it.
+    None where YOLO can't run (YOLO_ERROR says why; the caller uses the colour detector)."""
+    global YOLO, YOLO_ERROR
+    p = DEFAULT_PARAMS | (params or {})
+    conf = p["yolo_conf"]
+    with _YOLO_LOCK:
+        if YOLO_ERROR is not None:
+            return None
+        if YOLO is None:
+            import yolo_pieces      # here: ultralytics (torch) loads only when YOLO is switched on
+            YOLO = yolo_pieces.Detector()
+    try:
+        boxes = YOLO.detect([img], conf / 2)[0]
+    except (ImportError, RuntimeError, FileNotFoundError) as e:     # not installed, no model: not a bad picture
+        with _YOLO_LOCK:
+            if YOLO_ERROR is None:
+                YOLO_ERROR = str(e)
+                print(f"YOLO can't run, using the colour detector: {e}", flush=True)
+        return None
+    found, low = [], []
+    for b in boxes:
+        x1, y1, x2, y2 = b.xyxy
+        # the box holds top and side; the top face's centre is about a quarter of the box height down from its top
+        # (0.2 seen from 30 degrees above the table, 0.33 from 60): the fit searches +-r around it anyway
+        u, v = view.image_to_view((x1 + x2) / 2, y1 + 0.25 * (y2 - y1))
+        if not (0 <= u < top.shape[1] and 0 <= v < top.shape[0]):
+            continue        # off the table the top view covers: pieces in the background, or above the horizon
+        hit = detect(top, r_px, **(kw | {"colors": {b.color: p["colors"][b.color]}}), smear=view.smear, probe=(u, v))
+        u, v = float(u), float(v)
+        r = (b.color, *hit[1:5], 0.0, b.conf) if hit else (b.color, u, v, 0.0, 0.0, 0.0, b.conf)
+        (found if b.conf >= conf else low).append((r, (u, v)))
+    # two fits on one piece: the box that started nearer the fit keeps it, the other its own YOLO estimate
+    for i in range(len(found)):
+        for j in range(i + 1, len(found)):
+            (a, sa), (b, sb) = found[i], found[j]
+            if a[0] == b[0] and np.hypot(a[1] - b[1], a[2] - b[2]) < 1.4 * r_px:
+                k = j if np.hypot(sb[0] - b[1], sb[1] - b[2]) >= np.hypot(sa[0] - a[1], sa[1] - a[2]) else i
+                r, s = found[k]
+                found[k] = ((r[0], *s, 0.0, 0.0, 0.0, r[6]), s)
+    return [r for r, _ in found], [r for r, _ in low]
 
 
 def detect_kwargs(params):
@@ -499,7 +565,8 @@ def draw_misses(vis, misses, view: TopView):
         x, y, z = p.table_mm
         ring = view.project(np.c_[x + PIECE_D_MM / 2 * np.cos(ang), y + PIECE_D_MM / 2 * np.sin(ang), np.full(32, z)])
         cv2.polylines(vis, [ring.round().astype(np.int32)], True, (170, 170, 170), 1, cv2.LINE_AA)
-        label = f"{p.color}? rim {p.rim:.2f} fill {p.fill:.2f} around {p.around:.2f}"
+        label = (f"{p.color}? rim {p.rim:.2f} fill {p.fill:.2f} around {p.around:.2f}" if p.conf is None else
+                 f"{p.color}? YOLO conf {p.conf:.2f}")
         at = (int(ring[:, 0].min()), int(ring[:, 1].max()) + 14)
         cv2.putText(vis, label, at, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(vis, label, at, cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)

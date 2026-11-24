@@ -158,12 +158,9 @@ class Engine:
                                             # a lot of CPU on a slow PC, and only that tab shows it)
         self.det = None                     # the latest detection, see detect()
         self.det_error = None
-        # YOLO detection (Detection tab's switch): boxes in the camera pictures instead of the colour detector, no
-        # calibration needed. yolo_det: the latest, {"boxes": (left [Box], right [Box]), "frames", "key", "seconds"}
+        # the YOLO model (Detection tab's YOLO switch): finds the pieces, the circle fit places them
         self.yolo = yolo_pieces.Detector(yolo_weights or yolo_pieces.WEIGHTS)
-        self.use_yolo = False
-        self.yolo_conf = yolo_pieces.CONF
-        self.yolo_det = None
+        pieces.YOLO = self.yolo     # detect_pieces runs it when params["yolo"] is on (the YOLO switch, saved)
         self._build_views()
         threading.Thread(target=self._grab_loop, daemon=True).start()
         threading.Thread(target=self._detect_loop, daemon=True).start()
@@ -487,36 +484,27 @@ class Engine:
         return Path(zip_path), summary
 
     # -- detection
+    @property
+    def use_yolo(self):
+        return bool(self.params.get("yolo"))
+
     def set_yolo(self, on):
-        """Switch between the colour detector and YOLO; drops the other one's result."""
+        """YOLO finds the pieces, the circle fit places them (pieces.yolo_fit); off: the colour detector. A threshold
+        like the others: Save keeps it, and the runner and robot_app then use it too."""
+        self.set_param(lambda p: p.update(yolo=bool(on)))
         with self.lock:
-            self.use_yolo = bool(on)
-            self.det = self.yolo_det = self.det_error = None
+            self.det = self.det_error = None
 
     def _detect_loop(self):
         done = None
         while True:
             with self.lock:
                 frames, fid, views, calib = self.frames, self.frame_id, self.views, self.calib
-                yolo, conf = self.use_yolo, self.yolo_conf
-                key = ("yolo", fid, conf) if yolo else (fid, self.params_id, self.calib_id)
+                key = (fid, self.params_id, self.calib_id)
                 params = copy.deepcopy(self.params)
                 want = self.want_detect
-            if not want or (views is None and not yolo) or frames[0] is None or key == done:
+            if not want or views is None or frames[0] is None or key == done:
                 time.sleep(0.1)
-                continue
-            if yolo:
-                try:
-                    t0 = time.monotonic()
-                    boxes = self.yolo.detect(list(frames), conf)
-                    res = {"boxes": tuple(boxes), "frames": frames, "key": key, "seconds": time.monotonic() - t0}
-                    with self.lock:
-                        if self.use_yolo:
-                            self.yolo_det, self.det_error = res, None
-                except Exception as e:
-                    self.det_error = f"YOLO failed: {e}"
-                    time.sleep(1.0)
-                done = key
                 continue
             try:
                 t0 = time.monotonic()
@@ -664,7 +652,6 @@ def picture(E: Engine, name, mask=None, misses=False, lone=False):
     i = SIDES.index(side)
     with E.lock:
         frames, corners, det, views, calib = E.frames, E.corners, E.det, E.views, E.calib
-        ydet = E.yolo_det if E.use_yolo else None
         caps = [getattr(c, side) for c in E.captures if getattr(c, side) is not None]
         params = copy.deepcopy(E.params)
     pattern = E.pattern
@@ -710,8 +697,6 @@ def picture(E: Engine, name, mask=None, misses=False, lone=False):
         pic = base
     if mask:
         pic = pieces.mask_view(pic, params, mask)
-    if ydet:
-        return yolo_pieces.draw(pic, ydet["boxes"][i]) if kind == "cam" else pic
     if det:
         alone = det["lone"][i]
         found = det["found"][i] if lone else [p for p in det["found"][i] if not any(p is q for q in alone)]
@@ -788,14 +773,11 @@ def build_ui(E: Engine):
             chip_cam.props(f"color={color} text-color=white")
             chip_cal.text, color = E.calib_status()
             chip_cal.props(f"color={color} text-color=white")
-            d, yd = E.det, E.yolo_det
+            d = E.det
             if E.det_error:
                 chip_det.text, color = E.det_error[:50], "negative"
-            elif E.use_yolo and yd:
-                nl, nr = (len(b) for b in yd["boxes"])
-                chip_det.text, color = f"YOLO {nl} left, {nr} right · {yd['seconds']:.2f} s", "positive"
-            elif E.use_yolo:
-                chip_det.text, color = "YOLO loading…" if det.live.value else "detection off", "grey"
+            elif E.use_yolo and pieces.YOLO_ERROR:
+                chip_det.text, color = f"no YOLO, colour detector: {pieces.YOLO_ERROR}"[:50], "warning"
             elif d:
                 n = sum(st is not None for _, st in d["matched"])
                 chip_det.text, color = f"{n} piece{'s' if n != 1 else ''} · {d['seconds']:.1f} s", "positive"
@@ -1045,12 +1027,15 @@ def detection_panel(E):
                     "Grey circles with scores where something piece-like was rejected: which minimum keeps it out")
                 live = ui.switch("Live detection", value=True)
                 yolo_on = ui.switch("YOLO", value=E.use_yolo, on_change=lambda e: E.set_yolo(e.value)).tooltip(
-                    f"The trained YOLO model instead of the colour detector: a box per piece in each camera picture "
-                    f"with its confidence. No calibration needed, no table positions yet. Model: {E.yolo.weights}")
-                yolo_conf = ui.number("conf ≥", value=E.yolo_conf, min=0.05, max=0.95, step=0.05, format="%.2f") \
+                    f"The trained YOLO model finds the pieces and their colours, the circle fit puts each on its top "
+                    f"face (the colour thresholds still matter for that). Save keeps it on for the runner and "
+                    f"robot_app too. Model: {E.yolo.weights}")
+                yolo_conf = ui.number("conf ≥", value=E.params["yolo_conf"], min=0.05, max=0.95, step=0.05,
+                                      format="%.2f") \
                     .props("dense outlined").classes("w-20").bind_visibility_from(yolo_on, "value") \
                     .tooltip("Boxes less confident than this are dropped")
-                yolo_conf.on_value_change(lambda e: setattr(E, "yolo_conf", float(e.value)) if e.value else None)
+                yolo_conf.on_value_change(
+                    lambda e: E.set_param(lambda p: p.update(yolo_conf=float(e.value))) if e.value else None)
                 ui.button(icon="fullscreen", on_click=lambda: open_full()).props("flat dense").tooltip("Full screen")
                 ui.button(icon="bug_report", on_click=lambda: snap_dlg.open()).props("flat dense") \
                     .tooltip("Debug snapshot: pictures, settings and detection in one zip, to send")
@@ -1138,7 +1123,7 @@ def detection_panel(E):
         dlg.open()
 
     async def click(e, s):
-        if not teach_on.value or yolo_on.value:
+        if not teach_on.value:
             return
         try:
             msg = await run.io_bound(E.teach, s, "cam" if kind.value == "cam" else "top", e.image_x, e.image_y,
@@ -1156,7 +1141,9 @@ def detection_panel(E):
 
     class Panel:
         def tick(self):
-            d = E.yolo_det if yolo_on.value else E.det
+            if yolo_on.value != E.use_yolo:      # Defaults changed it
+                yolo_on.value = E.use_yolo
+            d = E.det
             dkey = d["key"] if d else None
             key = (E.frame_id, dkey, kind.value, side.value, mask.value, show_misses.value, show_lone.value, full["open"],
                    E.params_id, yolo_on.value)
@@ -1172,15 +1159,7 @@ def detection_panel(E):
                 s = "right" if side.value == "right" else "left"
                 full_title.text = f"{s} camera · {dict(cam='image', top='top view', edges='edges')[kind.value]}"
                 full_img.set_source(f"/v2img/{kind.value}_{s}.jpg{q}")
-            if d and yolo_on.value:
-                rows = [{"c": b.color, "xyz": f"{side_name} · conf {b.conf:.2f} · at ({b.center[0]:.0f}, "
-                                              f"{b.center[1]:.0f}) px"}
-                        for side_name, boxes in zip(SIDES, d["boxes"]) for b in boxes]
-                if rows != shown["rows"]:
-                    shown["rows"] = rows
-                    table.rows = rows
-                    table.update()
-            elif d:
+            if d:
                 rows = [{"c": p.color, "xyz": f"{st[0]:.0f}, {st[1]:.0f}, {st[2]:.0f}"} for p, st in d["matched"]
                         if st is not None]
                 for side_name, alone in zip(("left", "right"), d["lone"]):

@@ -191,7 +191,8 @@ class Vision:
             raise RuntimeError(f"{path} was made with left {made_with.get('left')} / right {made_with.get('right')}, but "
                                f"the cameras are now left {st['left']} / right {st['right']}: capture the table pose "
                                "again in calib_gui.py (or swap the cameras back)")
-        self.params = pieces.load_params(None if synthetic else cameras.DETECTION_PATH)
+        # the synthetic scenes are rendered, not photographed: the colour detector, not the YOLO model trained on photos
+        self.params = pieces.load_params(None) | {"yolo": False} if synthetic else pieces.load_params(cameras.DETECTION_PATH)
         b = cameras.SYNTHETIC_BOARD_MM if synthetic else float(st["board_mm"])
         self.views = pieces.view_from_calib(self.calib, "left", b), pieces.view_from_calib(self.calib, "right", b)
         w, h = int(st["width"]), int(st["height"])
