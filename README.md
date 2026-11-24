@@ -165,11 +165,11 @@ If the link to rosbridge drops, STOP can't reach the arm: the panel says so in r
    OpenMANIPULATOR-X. A differently sized (e.g. 3D-printed) arm needs its own lengths there, measured
    joint axis to joint axis, and `TOOL` measured from joint 4 to the fingertips. Rerun the kinematics
    self-test afterwards.
-2. **Cameras + table pose.** `./lab.sh python calib_gui.py`, Calibration tab: lay the checkerboard (9 × 6 inner
-   corners, 25 mm squares) flat on the table, seen by both cameras, and press Capture. That one capture gives both
-   cameras' poses and the stereo geometry, and defines the table frame every position is measured in. Extra
-   captures of the board at other angles improve the lens model (from 6 per camera: distortion too). Once that's
-   done, don't move the cameras or the table.
+2. **Cameras + table pose.** `./lab.sh python calib_app.py`, Calibration tab: first **Capture view** with the
+   checkerboard (9 × 6 inner corners) held at different angles, 6 or more per camera, so each lens is fitted with
+   its distortion; views both cameras see fit the stereo geometry too. Then lay the board flat on the table, seen
+   by both cameras, and press **Capture table**: that defines the table frame every position is measured in. Once
+   that's done, don't move the cameras or the table.
 3. **Colours.** Check the detection tab under the lab lights. Tune the thresholds under *Sensitivity* if a colour
    is missed or a piece is seen twice, then Save (`calib_data/detection.json`, which the runner reads).
 4. **Table → robot.** `./lab.sh python robot_frame.py`: close the gripper and touch the
