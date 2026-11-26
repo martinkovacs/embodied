@@ -318,13 +318,14 @@ def rim_hits(edges, xs, ys, r_px, rim_band):
 
 
 def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=None, smear=None, rejected=None,
-           max_around=0.9, edge_pct=90.0, mask_edges=True, rim_band=0.12, probe=None):
+           max_around=0.9, edge_pct=90.0, mask_edges=True, rim_band=0.12, probe=None, probes=None):
     """Find top-face circles of radius r_px. Returns [(color, u, v, rim, fill)].
 
     edge_pct, mask_edges, rim_band: what counts as the rim (DEFAULT_PARAMS).
     probe: (u, v) instead of searching the whole image: the best circle near there, whatever its scores, as
     (color, u, v, rim, fill, around, brightness, edge threshold), or None where there is no colour at all. For
-    telling why a piece isn't found.
+    telling why a piece isn't found. probes: [(u, v), ...] instead: a list of those, one per point, from one pass
+    over the image (yolo_fit: every box of a colour at once).
 
     smear(u, v) -> (du, dv): where a piece's side shows in this image (TopView.smear). Without it, a candidate on
     the side of a piece seen at an angle can survive as a second detection of the same piece.
@@ -356,24 +357,27 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     bright = cv2.filter2D(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 2].astype(np.float32) / 255, -1, inner,
                           borderType=cv2.BORDER_CONSTANT)
 
-    # Candidates: colour-disk peaks + fixed-radius Hough on the grey image.
-    cands = []
-    for f in fills.values():
-        peaks = ((f >= cv2.dilate(f, _disk(0.3 * r_px))) & (f >= min_fill)).astype(np.uint8)
-        # one candidate per peak region (flat plateaus, e.g. a white table, would give millions of pixels)
-        n, _, stats, centroids = cv2.connectedComponentsWithStats(peaks)
-        cands += [tuple(c) for c, st in zip(centroids[1:], stats[1:]) if st[cv2.CC_STAT_AREA] < (2 * r_px) ** 2]
-    circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1, minDist=0.5 * r_px, param1=60,
-                               param2=hough_votes or max(8, int(0.5 * r_px)),
-                               minRadius=int(r_px * 0.9), maxRadius=int(np.ceil(r_px * 1.1)))
-    if circles is not None:
-        cands += [(float(x), float(y)) for x, y, _ in circles[0]]
-    cands += rim_votes(gx, gy, mag, edge_thr, r_px, min_rim)
-    # candidates this close end up at the same top face after the grid search: refine one of them
-    cell = max(r_px / 3, 1.0)
-    cands = list({(round(x / cell), round(y / cell)): (x, y) for x, y in cands}.values())
     if probe is not None:
-        cands = [tuple(map(float, probe))]
+        probes = [probe]
+    if probes is None:
+        # Candidates: colour-disk peaks + fixed-radius Hough on the grey image.
+        cands = []
+        for f in fills.values():
+            peaks = ((f >= cv2.dilate(f, _disk(0.3 * r_px))) & (f >= min_fill)).astype(np.uint8)
+            # one candidate per peak region (flat plateaus, e.g. a white table, would give millions of pixels)
+            n, _, stats, centroids = cv2.connectedComponentsWithStats(peaks)
+            cands += [tuple(c) for c, st in zip(centroids[1:], stats[1:]) if st[cv2.CC_STAT_AREA] < (2 * r_px) ** 2]
+        circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1, minDist=0.5 * r_px, param1=60,
+                                   param2=hough_votes or max(8, int(0.5 * r_px)),
+                                   minRadius=int(r_px * 0.9), maxRadius=int(np.ceil(r_px * 1.1)))
+        if circles is not None:
+            cands += [(float(x), float(y)) for x, y, _ in circles[0]]
+        cands += rim_votes(gx, gy, mag, edge_thr, r_px, min_rim)
+        # candidates this close end up at the same top face after the grid search: refine one of them
+        cell = max(r_px / 3, 1.0)
+        cands = list({(round(x / cell), round(y / cell)): (x, y) for x, y in cands}.values())
+    else:   # probing: only those points, none of the searches above
+        cands = [tuple(map(float, q)) for q in probes]
 
     # Score = rim * fill * brightness. Rim: on how many of 72 rays around the circle there is an edge
     # with a radial gradient. Each candidate is refined by a grid search within +-r, because Hough and
@@ -402,11 +406,11 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
     reach = int(np.ceil(r_px + r_px / 8)) + 1
     best_fill = cv2.dilate(fill_stack.max(0), np.ones((2 * reach + 1, 2 * reach + 1), np.uint8))
     need_fill = min(min_fill, 0.4)
-    results = []
+    results, probed = [], []
     for x, y in cands:
         if best_fill[min(max(int(round(y)), 0), h - 1), min(max(int(round(x)), 0), w - 1)] < need_fill:
-            if probe is not None:
-                return None
+            if probes is not None:
+                probed.append(None)
             continue
         for ox, oy in (coarse, fine):  # coarse search within +-r, then fine within +-r/8
             xs, ys = x + ox, y + oy
@@ -416,9 +420,10 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
             k = int(s.argmax()) if s.max() > 0 else int(raw.argmax())   # nothing passes yet: follow the best try
             x, y = xs[k], ys[k]
         name = names[ci[k]]
-        if probe is not None:
-            return (name, float(x), float(y), float(rim[k]), float(fill[k]), around_at(name, x, y), float(br[k]),
-                    edge_thr)
+        if probes is not None:
+            probed.append((name, float(x), float(y), float(rim[k]), float(fill[k]), around_at(name, x, y),
+                           float(br[k]), edge_thr))
+            continue
         if s[k] <= 0 and (rejected is None or fill[k] < 0.4 or rim[k] < 0.3):
             continue        # neither a piece nor a near miss: no need for its surround
         around = around_at(name, x, y)
@@ -426,6 +431,8 @@ def detect(bgr, r_px, colors=COLORS, min_rim=0.6, min_fill=0.55, hough_votes=Non
             results.append((name, float(x), float(y), float(rim[k]), float(fill[k]), float(br[k])))
         elif rejected is not None and fill[k] >= 0.4 and rim[k] >= 0.3:   # roughly piece-like only
             rejected.append((name, float(x), float(y), float(rim[k]), float(fill[k]), around, float(raw[k])))
+    if probes is not None:
+        return probed[0] if probe is not None else probed
 
     # Non-max suppression, best score first: one detection per piece. A candidate on the same piece as a kept one
     # (same_piece) is dropped, unless it lies further from the camera along the side band and scores at least half
@@ -506,7 +513,7 @@ def yolo_fit(img, top, view: TopView, r_px, params, kw):
                 YOLO_ERROR = str(e)
                 print(f"YOLO can't run, using the colour detector: {e}", flush=True)
         return None
-    found, low = [], []
+    found, low, starts = [], [], []
     for b in boxes:
         x1, y1, x2, y2 = b.xyxy
         # the box holds top and side; the top face's centre is about a quarter of the box height down from its top
@@ -514,8 +521,15 @@ def yolo_fit(img, top, view: TopView, r_px, params, kw):
         u, v = view.image_to_view((x1 + x2) / 2, y1 + 0.25 * (y2 - y1))
         if not (0 <= u < top.shape[1] and 0 <= v < top.shape[0]):
             continue        # off the table the top view covers: pieces in the background, or above the horizon
-        hit = detect(top, r_px, **(kw | {"colors": {b.color: p["colors"][b.color]}}), smear=view.smear, probe=(u, v))
-        u, v = float(u), float(v)
+        starts.append((b, (float(u), float(v))))
+    hits = {}       # one pass over the top view per colour (the edges and masks are most of the time), not per box
+    for c in {b.color for b, _ in starts}:
+        mine = [i for i, (b, _) in enumerate(starts) if b.color == c]
+        res = detect(top, r_px, **(kw | {"colors": {c: p["colors"][c]}}), smear=view.smear,
+                     probes=[starts[i][1] for i in mine])
+        hits |= dict(zip(mine, res))
+    for i, (b, (u, v)) in enumerate(starts):
+        hit = hits[i]
         r = (b.color, *hit[1:5], 0.0, b.conf) if hit else (b.color, u, v, 0.0, 0.0, 0.0, b.conf)
         (found if b.conf >= conf else low).append((r, (u, v)))
     # two fits on one piece: the box that started nearer the fit keeps it, the other its own YOLO estimate
